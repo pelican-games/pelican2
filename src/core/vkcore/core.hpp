@@ -21,7 +21,7 @@ enum class VulkanProcessType {
 
 DECLARE_MODULE(VulkanManageCore) {
     vk::UniqueInstance instance;
-    vk::UniqueSurfaceKHR surface;
+    vk::SurfaceKHR surface;
     vk::PhysicalDevice phys_device;
     QueueSet queue_set;
     vk::UniqueDevice device;
@@ -37,7 +37,7 @@ DECLARE_MODULE(VulkanManageCore) {
 
     vk::Device getDevice() const { return device.get(); };
     vk::PhysicalDevice getPhysDevice() const { return phys_device; };
-    vk::SurfaceKHR getSurface() const { return surface.get(); };
+    vk::SurfaceKHR getSurface() const { return surface; };
     vk::Queue getPresentationQueue() const { return presen_queue; }
 
     void waitIdle() const;

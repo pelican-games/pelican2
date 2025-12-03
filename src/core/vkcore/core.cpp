@@ -206,8 +206,8 @@ static vma::UniqueAllocator createAllocator(vk::PhysicalDevice phys_device, vk::
 
 VulkanManageCore::VulkanManageCore()
     : instance{vulkanCreateInstance(GET_MODULE(Window))}, surface{GET_MODULE(Window).getVulkanSurface(instance.get())},
-      phys_device{pickPhysicalDevice(instance.get(), surface.get())},
-      queue_set{pickQueues(phys_device, phys_device.getQueueFamilyProperties(), surface.get()).value()},
+      phys_device{pickPhysicalDevice(instance.get(), surface)},
+      queue_set{pickQueues(phys_device, phys_device.getQueueFamilyProperties(), surface).value()},
       device{createLogicalDevice(phys_device, queue_set)},
       graphic_queue{device->getQueue(queue_set.graphic_queue, 0)}, // queues
       presen_queue{device->getQueue(queue_set.presentation_queue, 0)},
