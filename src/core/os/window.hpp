@@ -1,11 +1,11 @@
 #pragma once
 
-
 #include <vulkan/vulkan.hpp>
 // include order must NOT be swap
 #include <GLFW/glfw3.h>
 
 #include "../container.hpp"
+#include "../userpublic/abstractscreen.hpp"
 #include <bitset>
 
 namespace Pelican {
@@ -20,6 +20,8 @@ struct KeyState {
 };
 
 DECLARE_MODULE(Window) {
+    AbstractScreen *screen;
+
     GLFWwindow *window;
 
     KeyState key_state;
@@ -29,6 +31,8 @@ DECLARE_MODULE(Window) {
   public:
     Window();
     ~Window();
+
+    void setScreen(AbstractScreen * _screen);
 
     vk::UniqueSurfaceKHR getVulkanSurface(vk::Instance instance);
     std::vector<const char *> getRequiredVulkanInstanceExts();

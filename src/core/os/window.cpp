@@ -44,6 +44,8 @@ Window::Window() {
 
 Window::~Window() {}
 
+void Window::setScreen(AbstractScreen *new_screen) { screen = new_screen; }
+
 bool Window::process() {
     key_state.pressing_old = key_state.pressing;
     glfwPollEvents();
