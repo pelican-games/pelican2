@@ -5,6 +5,9 @@
 #include <QQmlContext>
 #include <iostream>
 
+#include <pelican_core.hpp>
+#include <thread>
+
 namespace PelicanStudio {
 
 int uimain(int argc, char **argv) {
@@ -21,6 +24,10 @@ int uimain(int argc, char **argv) {
             QCoreApplication::exit(-1);
         },
         Qt::QueuedConnection);
+
+    Pelican::PelicanCore pcore;
+
+    std::thread th([&]() { pcore.run(); });
 
     MainWindow window;
     window.show();
