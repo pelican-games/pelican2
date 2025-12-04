@@ -27,9 +27,9 @@ int uimain(int argc, char **argv) {
 
     Pelican::PelicanCore pcore;
     MainWindow window{pcore};
+    window.show();
 
     std::thread th([&]() { pcore.run(); });
-    window.show();
     return app.exec();
 }
 
