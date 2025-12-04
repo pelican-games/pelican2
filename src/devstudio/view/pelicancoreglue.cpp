@@ -16,7 +16,14 @@ VkSurfaceKHR PelicanCoreGlue::getVulkanSurface(VkInstance instance) {
                               Q_ARG(VkInstance, instance));
     return surface;
 }
-std::vector<const char *> PelicanCoreGlue::getRequiredVulkanExtensions() { return {}; }
+std::vector<const char *> PelicanCoreGlue::getRequiredVulkanExtensions() {
+    return {
+        VK_KHR_SURFACE_EXTENSION_NAME,
+#ifdef WIN32
+        "VK_KHR_win32_surface",
+#endif
+    };
+}
 bool PelicanCoreGlue::process() { return true; }
 
 } // namespace PelicanStudio
