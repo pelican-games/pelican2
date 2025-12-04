@@ -26,10 +26,9 @@ int uimain(int argc, char **argv) {
         Qt::QueuedConnection);
 
     Pelican::PelicanCore pcore;
+    MainWindow window{pcore};
 
     std::thread th([&]() { pcore.run(); });
-
-    MainWindow window;
     window.show();
     return app.exec();
 }

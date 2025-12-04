@@ -1,7 +1,10 @@
 target_sources(pelican_studio PRIVATE
     uimain.cpp
     mainwindow.cpp
+    playerscreen.hpp
     playerscreen.cpp
+    pelicancoreglue.hpp
+    pelicancoreglue.cpp
 )
 
 set(CMAKE_AUTOMOC ON)

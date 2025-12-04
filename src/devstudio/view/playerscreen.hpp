@@ -1,3 +1,5 @@
+#pragma once
+
 #include <QVulkanWindow>
 #include <QWidget>
 
@@ -8,7 +10,7 @@ class PlayerScreen : public QWidget {
   public:
     PlayerScreen();
 
-    VkSurfaceKHR getSurface(VkInstance vk_instance);
+    Q_INVOKABLE VkSurfaceKHR getSurface(VkInstance vk_instance);
 };
 
 } // namespace PelicanStudio
