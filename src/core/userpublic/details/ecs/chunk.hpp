@@ -20,6 +20,7 @@ class ECSComponentChunk {
         VariedArray(size_t _stride) : count{0}, stride{_stride}, arr{} {}
 
         size_t size() const { return count; }
+        size_t capacity_bytes() const { return arr.capacity(); }
         size_t size_one() const { return stride; }
         void *data() { return arr.data(); }
         void *at(size_t index) { return static_cast<uint8_t *>(data()) + stride * index; }
@@ -33,6 +34,13 @@ class ECSComponentChunk {
         }
         void reserve(size_t capacity) {
             arr.reserve(capacity * stride);
+        }
+        void minimize() {
+            if (count == 0) {
+                std::vector<uint8_t>().swap(arr);
+            } else {
+                arr.shrink_to_fit();
+            }
         }
     };
 
@@ -101,6 +109,25 @@ class ECSComponentChunk {
     size_t allocate(std::span<const size_t> component_indices, std::span<void *> component_ptrs, size_t ex_count);
 
     void free(size_t free_count);
+
+    void minimize() {
+        for(auto& arr : component_arrays) {
+            if(arr.has_value()) {
+                arr->minimize();
+            }
+        }
+    }
+    
+    // Helper to calculate capacity in bytes
+    size_t getCapacityBytes() const {
+        size_t bytes = 0;
+        for(const auto& arr : component_arrays) {
+            if(arr.has_value()) {
+                bytes += arr->capacity_bytes();
+            }
+        }
+        return bytes;
+    }
 };
 
 } // namespace Pelican

@@ -65,7 +65,12 @@ void ECSCoreTemplatePublic::updateSystemChunkCache(ChunkIndex chunk_index) {
     const auto entity_id_comp_idx = component_indices_ex[0];
 
     // insert entity
-    EntityId entity_id_first = id_to_ref.size();
+    EntityId entity_id_first = 0; 
+    bool sequential_alloc = (count > 1) || free_indices.empty();
+
+    if (sequential_alloc) {
+         entity_id_first = id_to_ref.size();
+    }
 
     // add new chunk if suitable chunk is not found
     if (chunk_index == UINT32_MAX) {
@@ -100,8 +105,30 @@ void ECSCoreTemplatePublic::updateSystemChunkCache(ChunkIndex chunk_index) {
             .chunk_index = chunk_index,
             .array_index = static_cast<WithinChunkIndex>(first_index + i),
         };
-        entity_ids[i] = id_to_ref.size();
-        id_to_ref.emplace_back(entity_ref);
+
+        uint32_t my_idx = 0;
+        uint32_t my_gen = 0;
+
+        if (sequential_alloc) {
+             my_idx = id_to_ref.size();
+             id_to_ref.emplace_back(entity_ref);
+             // Ensure generation vector matches size
+             if (entity_generations.size() <= my_idx) {
+                 entity_generations.resize(my_idx + 1, 0);
+             }
+             my_gen = 0; 
+        } else {
+             // Recycle
+             my_idx = free_indices.back();
+             free_indices.pop_back();
+             id_to_ref[my_idx] = entity_ref;
+             my_gen = entity_generations[my_idx];
+        }
+
+        EntityId my_id = (static_cast<EntityId>(my_gen) << 32) | my_idx;
+        entity_ids[i] = my_id;
+        
+        if (i == 0) entity_id_first = my_id;
     }
 
     TimeProfilerEnd("ECS_AllocateEntity");
@@ -109,7 +136,17 @@ void ECSCoreTemplatePublic::updateSystemChunkCache(ChunkIndex chunk_index) {
 }
 
 void ECSCoreTemplatePublic::remove(EntityId id) {
-    const auto ref = id_to_ref[id];
+    uint32_t index = static_cast<uint32_t>(id & 0xFFFFFFFF);
+    uint32_t gen = static_cast<uint32_t>(id >> 32);
+
+    if (index >= entity_generations.size() || entity_generations[index] != gen) {
+        LOG_WARNING(logger, "Attempt to remove stale or invalid EntityId: {:x} (Index: {}, Gen: {})", id, index, gen);
+        return;
+    }
+    entity_generations[index]++; 
+    free_indices.push_back(index);
+
+    const auto ref = id_to_ref[index];
     auto &chunk = chunks_storage[ref.chunk_index];
 
     // Get EntityId component array using Dense Index
@@ -128,10 +165,117 @@ void ECSCoreTemplatePublic::remove(EntityId id) {
     }
 
     chunks_storage[ref.chunk_index].free(1);
-    id_to_ref[moved_id].array_index = ref.array_index;
+    uint32_t moved_index = static_cast<uint32_t>(moved_id & 0xFFFFFFFF);
+    
+    if (moved_index < id_to_ref.size()) {
+         id_to_ref[moved_index].array_index = ref.array_index;
+    } else {
+        LOG_ERROR(logger, "Moved entity has invalid index: {}", moved_index);
+    }
 }
 
-void ECSCoreTemplatePublic::compaction() { /* TODO */ }
+void ECSCoreTemplatePublic::compaction() {
+    TimeProfilerStart("ECS_Compaction");
+    
+    // Get EntityId component array using Dense Index
+    auto& mgr = GET_MODULE(ComponentInfoManager);
+    size_t entity_id_idx = mgr.getIndexFromComponentId(ComponentIdByType<EntityId>::value);
+
+    for (auto &[archetype, chunk_indices] : archetype_to_chunks) {
+        if (chunk_indices.empty()) continue;
+
+        size_t target_chunk_list_idx = 0;
+        size_t source_chunk_list_idx = chunk_indices.size() - 1;
+
+        while (target_chunk_list_idx < source_chunk_list_idx) {
+            ChunkIndex target_idx = chunk_indices[target_chunk_list_idx];
+            ChunkIndex source_idx = chunk_indices[source_chunk_list_idx];
+            
+            auto& target_chunk = chunks_storage[target_idx];
+            auto& source_chunk = chunks_storage[source_idx];
+
+            // If target is full, move next
+            if (target_chunk.size() >= ECSComponentChunk::CHUNK_CAPACITY) {
+                target_chunk_list_idx++;
+                continue;
+            }
+
+            // If source is empty, move prev
+            if (source_chunk.size() == 0) {
+                source_chunk_list_idx--;
+                continue;
+            }
+
+            // Calculate how many to move
+            size_t available_space = ECSComponentChunk::CHUNK_CAPACITY - target_chunk.size();
+            size_t source_count = source_chunk.size();
+            size_t move_count = std::min(available_space, source_count);
+            
+            // Allocate space in target
+            size_t target_start_index = target_chunk.size();
+            auto indices = target_chunk.getIndices();
+            std::vector<void*> dummy_ptrs(indices.size() + 1); /
+            std::vector<size_t> indices_vec(indices.begin(), indices.end());
+            std::vector<void*> ptrs_vec(indices.size()); 
+            
+            target_chunk.allocate(indices_vec, ptrs_vec, move_count);
+            
+            // Now Copy Data
+            for (size_t i = 0; i < move_count; ++i) {
+                size_t src_index_in_chunk = source_chunk.size() - 1 - i;
+                size_t dst_index_in_chunk = target_start_index + i;
+                
+                // For each component type (by index)
+                for (auto comp_idx : indices) {
+                    auto src_ref = source_chunk.getRef(comp_idx);
+                    auto dst_ref = target_chunk.getRef(comp_idx);
+                    
+                    std::memcpy(
+                        static_cast<uint8_t*>(dst_ref.ptr) + dst_ref.stride * dst_index_in_chunk,
+                        static_cast<uint8_t*>(src_ref.ptr) + src_ref.stride * src_index_in_chunk,
+                        src_ref.stride
+                    );
+                    
+                    // Update version
+                    target_chunk.updateVersion(comp_idx, global_tick);
+                }
+                
+                // Update EntityRef
+                EntityId* entity_ids_ptr = static_cast<EntityId*>(source_chunk.getRef(entity_id_idx).ptr);
+                EntityId moved_entity_id = entity_ids_ptr[src_index_in_chunk];
+                
+                id_to_ref[moved_entity_id].chunk_index = target_idx;
+                id_to_ref[moved_entity_id].array_index = dst_index_in_chunk;
+            }
+
+            // Remove from source
+            source_chunk.free(move_count);
+        }
+        
+        // After compaction of this archetype, check for minimized chunks
+        size_t minimized_count = 0;
+        for (auto idx : chunk_indices) {
+            auto& chunk = chunks_storage[idx];
+            if (chunk.size() == 0) {
+                 chunk.minimize();
+                 minimized_count++;
+            }
+        }
+        if (minimized_count > 0) {
+            LOG_INFO(logger, "Compaction: Archetype (size {}) - Minimized {} empty chunks", archetype.size(), minimized_count);
+        }
+    }
+
+    TimeProfilerEnd("ECS_Compaction");
+}
+
+size_t ECSCoreTemplatePublic::getTotalCapacity() const {
+    size_t total = 0;
+    for(const auto& chunk : chunks_storage) {
+        total += chunk.getCapacityBytes();
+    }
+    return total;
+}
 
 void ECSCoreTemplatePublic::unregisterSystem(SystemId system_id) {
     for (const auto depends : systems.at(system_id).depends_list) {

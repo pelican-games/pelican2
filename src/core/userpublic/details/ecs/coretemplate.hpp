@@ -39,6 +39,8 @@ class ECSCoreTemplatePublic {
         WithinChunkIndex array_index;
     };
     std::vector<EntityRef> id_to_ref;
+    std::vector<uint32_t> entity_generations;
+    std::vector<uint32_t> free_indices;
 
     struct VectorHash {
         size_t operator()(const std::vector<ComponentId> &v) const {
@@ -57,6 +59,7 @@ class ECSCoreTemplatePublic {
     EntityId allocateEntity(std::span<const ComponentId> component_ids, std::span<void *> component_ptrs, size_t count);
     void remove(EntityId id);
     void compaction();
+    size_t getTotalCapacity() const;
 
     // System Management
   private:

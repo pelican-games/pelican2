@@ -21,6 +21,7 @@ DECLARE_MODULE(ECSCore) {
     }
     void remove(EntityId id) { sub.remove(id); }
     void compaction() { sub.compaction(); }
+    size_t getTotalCapacity() const { return sub.getTotalCapacity(); }
 
     template <class TSystem, class... TComponents>
     SystemId registerSystem(TSystem & system, std::vector<SystemId> && depends_list, bool force_update = false) {

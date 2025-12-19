@@ -1,0 +1,291 @@
+#include "core.hpp"
+#include "../profiler.hpp"
+#include "../log.hpp"
+#include "componentinfo.hpp"
+#include "predefined.hpp"
+#include "predefined/transform.hpp"
+#include <iostream>
+#include <vector>
+#include <random>
+#include <glm/glm.hpp>
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+
+#pragma comment(lib, "psapi.lib")
+
+using namespace Pelican;
+
+size_t getProcessMemoryUsage() {
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+        return pmc.PrivateUsage;
+    }
+    return 0;
+}
+
+namespace Pelican {
+
+struct VelocityComponent {
+    glm::vec3 velocity;
+};
+struct RenderComponent {
+    uint32_t mesh_id;
+    uint32_t material_id;
+};
+DECLARE_COMPONENT(VelocityComponent, 10);
+DECLARE_COMPONENT(RenderComponent, 11);
+
+}
+
+// Systems
+struct PhysicsSystem {
+    using QueryComponents = std::tuple<TransformComponent *, VelocityComponent *>;
+
+    void process(std::tuple<TransformComponent *, VelocityComponent *> components, size_t count) {
+        auto [transforms, velocities] = components;
+        for (size_t i = 0; i < count; ++i) {
+            transforms[i].pos += velocities[i].velocity * 0.016f; // dt = 16ms
+        }
+    }
+};
+
+struct RenderSystem {
+    using QueryComponents = std::tuple<TransformComponent *, RenderComponent *>;
+
+    void process(std::tuple<TransformComponent *, RenderComponent *> components, size_t count) {
+        auto [transforms, renders] = components;
+        volatile int dummy = 0; // Prevent optimization
+        for (size_t i = 0; i < count; ++i) {
+            // Simulate rendering overhead (matrix calculation etc)
+            glm::mat4 model = glm::mat4(1.0f);
+            model = glm::translate(model, transforms[i].pos);
+            model = glm::scale(model, transforms[i].scale);
+            dummy += renders[i].mesh_id + static_cast<int>(model[3][0]);
+        }
+    }
+};
+
+// ...
+
+
+// ...
+struct CrashSystem {
+    // Disable crash for now to test Global View
+    void process(std::tuple<EntityId*> components, size_t count) {
+        /* 
+        auto [entities] = components;
+        for (size_t i = 0; i < count; ++i) {
+             if (entities[i] % 100 == 0) { 
+                 GET_MODULE(ECSCore).remove(entities[i]);
+             }
+        }
+        */
+    }
+};
+
+// 全部のChnukに対して適用する例 std::span<ChunkView<TComponents...>>をもつメソッドを持っているかで、全部に判定するかどうかを自動で選択している(こういうことじゃなかったらごめんなさい...)
+struct GlobalCheckSystem {
+    // Test Global View
+    void process_all(std::span<ChunkView<TransformComponent>> chunks) {
+        size_t total_entities = 0;
+        for (auto& chunk : chunks) {
+            total_entities += chunk.count;
+            
+            // Verify access
+            auto [transforms] = chunk.components;
+            // Simple read to ensure valid styling
+            volatile float x = transforms[0].pos.x; 
+            (void)x;
+        }
+        // std::cout << "GlobalCheckSystem saw " << total_entities << " entities." << std::endl;
+    }
+};
+
+struct CompactionVerificationSystem {
+    size_t count_observed = 0;
+    void process(std::tuple<TransformComponent*> components, size_t count) {
+        count_observed += count;
+        auto [transforms] = components;
+        volatile float sum = 0;
+        for(size_t i=0; i<count; ++i) {
+            sum += transforms[i].pos.x; // Access to check validity
+        }
+    }
+};
+
+int main() {
+    Pelican::setupLogger();
+
+    // Initialize ComponentInfoManager
+    auto& componentInfoManager = GET_MODULE(ComponentInfoManager);
+    componentInfoManager.registerComponent(ComponentInfo{
+        .id = ComponentIdByType<EntityId>::value,
+        .size = sizeof(EntityId),
+        .name = "EntityId",
+    });
+    componentInfoManager.registerComponent(ComponentInfo{
+        .id = ComponentIdByType<TransformComponent>::value,
+        .size = sizeof(TransformComponent),
+        .name = "TransformComponent",
+    });
+    componentInfoManager.registerComponent(ComponentInfo{
+        .id = ComponentIdByType<VelocityComponent>::value,
+        .size = sizeof(VelocityComponent),
+        .name = "VelocityComponent",
+    });
+    componentInfoManager.registerComponent(ComponentInfo{
+        .id = ComponentIdByType<RenderComponent>::value,
+        .size = sizeof(RenderComponent),
+        .name = "RenderComponent",
+    });
+
+    ECSCore ecs;
+    PhysicsSystem physicsSystem;
+    RenderSystem renderSystem;
+    CrashSystem crashSystem;
+// GlobalCheckSystem globalSystem;
+
+    // Register systems
+    ecs.registerSystem<PhysicsSystem, TransformComponent, VelocityComponent>(physicsSystem, {});
+    ecs.registerSystem<RenderSystem, TransformComponent, RenderComponent>(renderSystem, {});
+    ecs.registerSystem<CrashSystem, EntityId>(crashSystem, {});
+// ecs.registerSystem<GlobalCheckSystem, TransformComponent>(globalSystem, {});
+
+    // Allocate entities with mixed archetypes
+    const int entityCount = 100000;
+    std::cout << "Allocating " << entityCount << " entities for functionality test..." << std::endl;
+
+    // Archetype 1: Static (Transform) - 40%
+    {
+        int count = entityCount * 0.4;
+        std::vector<ComponentId> ids = {ComponentIdByType<TransformComponent>::value};
+        std::vector<void*> ptrs(1);
+        ecs.allocateEntity(std::span(ids), std::span(ptrs), count);
+        
+        TransformComponent* transforms = static_cast<TransformComponent*>(ptrs[0]);
+        for(int i=0; i<count; ++i) transforms[i].pos = glm::vec3(i, 0, 0);
+    }
+
+    // Archetype 2: Dynamic (Transform + Velocity) - 40%
+    {
+        int count = entityCount * 0.4;
+        std::vector<ComponentId> ids = {
+            ComponentIdByType<TransformComponent>::value,
+            ComponentIdByType<VelocityComponent>::value
+        };
+        std::vector<void*> ptrs(2);
+        ecs.allocateEntity(std::span(ids), std::span(ptrs), count);
+        
+        TransformComponent* transforms = static_cast<TransformComponent*>(ptrs[0]);
+        VelocityComponent* velocities = static_cast<VelocityComponent*>(ptrs[1]);
+        for(int i=0; i<count; ++i) {
+            transforms[i].pos = glm::vec3(i, 10, 0);
+            velocities[i].velocity = glm::vec3(1.0f, 0.0f, 0.0f);
+        }
+    }
+
+    // Archetype 3: Visible Dynamic (Transform + Velocity + Render) - 20%
+    {
+        int count = entityCount * 0.2;
+        std::vector<ComponentId> ids = {
+            ComponentIdByType<TransformComponent>::value,
+            ComponentIdByType<VelocityComponent>::value,
+            ComponentIdByType<RenderComponent>::value
+        };
+        std::vector<void*> ptrs(3);
+        ecs.allocateEntity(std::span(ids), std::span(ptrs), count);
+        
+        TransformComponent* transforms = static_cast<TransformComponent*>(ptrs[0]);
+        VelocityComponent* velocities = static_cast<VelocityComponent*>(ptrs[1]);
+        RenderComponent* renders = static_cast<RenderComponent*>(ptrs[2]);
+        for(int i=0; i<count; ++i) {
+            transforms[i].pos = glm::vec3(i, 20, 0);
+            velocities[i].velocity = glm::vec3(0.0f, 1.0f, 0.0f);
+            renders[i].mesh_id = i % 10;
+        }
+    }
+
+    std::cout << "Starting benchmark with Global View..." << std::endl;
+
+    TimeProfilerStart("ECS_Benchmark_Total");
+    for (int i = 0; i < 100; ++i) {
+        ecs.update();
+    }
+    TimeProfilerEnd("ECS_Benchmark_Total");
+
+    std::cout << "Benchmark finished." << std::endl;
+
+    // --- COMPACTION STRESS TEST ---
+    std::cout << "Starting Compaction Stress Test..." << std::endl;
+    LOG_INFO(logger, "--- Stress Test Start ---");
+
+    {
+        const int stressCount = 10000;
+        const int removeCount = 10000; // Remove all to test zero growth
+        const int batchSize = 4096;
+        std::vector<ComponentId> ids = {ComponentIdByType<TransformComponent>::value};
+        
+        // Helper to allocate
+        auto allocateBatch = [&](int count) -> std::vector<EntityId> {
+             std::vector<EntityId> newIds;
+             newIds.reserve(count);
+             for(int i=0; i<count; ++i) {
+                 float x = (float)(rand() % 100);
+                 float y = (float)(rand() % 100);
+                 float z = (float)(rand() % 100);
+                 TransformComponent transform{glm::vec3(x, y, z), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(1.0f)};
+                 void* component_ptrs[] = { &transform };
+                 
+                 // Allocate ONE by ONE to support recycling and captured IDs
+                 EntityId id = ecs.allocateEntity(ids, component_ptrs, 1);
+                 newIds.push_back(id);
+             }
+             return newIds;
+        };
+
+        // --- 100 CYCLE STRESS TEST ---
+        const int cycles = 100;
+        size_t prevCap = getProcessMemoryUsage();
+        
+        for (int cycle = 1; cycle <= cycles; ++cycle) {
+            std::cout << "Cycle " << cycle << "/" << cycles << "..." << std::endl;
+            
+            // 1. Allocate
+            std::vector<EntityId> currentIds = allocateBatch(stressCount);
+            
+            // 2. Remove (ALL of them) to test metadata recycling
+            for(int i=0; i<stressCount; ++i) {
+                 ecs.remove(currentIds[i]);
+            }
+            
+            // 3. Compact
+            // TimeProfilerStart("Stress_Compaction"); 
+            ecs.compaction();
+            // TimeProfilerEnd("Stress_Compaction");
+
+            // Log Memory
+            size_t currentCap = getProcessMemoryUsage();
+            int64_t diff = (int64_t)currentCap - (int64_t)prevCap;
+            
+            LOG_INFO(logger, "Cycle {:03}: Memory = {:10} bytes (Diff: {:+10})", cycle, currentCap, diff);
+            // Also print to console occasionally
+            if (cycle % 10 == 0) {
+                 std::cout << "  Cycle " << cycle << ": " << currentCap << " bytes" << std::endl;
+            }
+            
+            prevCap = currentCap;
+        }
+
+        LOG_INFO(logger, "--- Stress Test End ---");
+        
+        // Final verify
+        CompactionVerificationSystem veriSystem;
+        ecs.registerSystem<CompactionVerificationSystem, TransformComponent>(veriSystem, {});
+        ecs.update();
+        std::cout << "Stress test finished." << std::endl;
+    }
+
+    
+    return 0;
+}
