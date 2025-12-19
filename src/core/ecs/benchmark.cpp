@@ -88,7 +88,6 @@ struct GlobalCheckSystem {
     }
 };
 
-
 int main() {
     Pelican::setupLogger();
 
@@ -128,7 +127,7 @@ int main() {
 // ecs.registerSystem<GlobalCheckSystem, TransformComponent>(globalSystem, {});
 
     // Allocate entities with mixed archetypes
-    const int entityCount = 100000; 
+    const int entityCount = 100000;
     std::cout << "Allocating " << entityCount << " entities for functionality test..." << std::endl;
 
     // Archetype 1: Static (Transform) - 40%
