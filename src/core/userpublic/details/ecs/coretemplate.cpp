@@ -214,7 +214,7 @@ void ECSCoreTemplatePublic::compaction() {
             // Allocate space in target
             size_t target_start_index = target_chunk.size();
             auto indices = target_chunk.getIndices();
-            std::vector<void*> dummy_ptrs(indices.size() + 1); /
+            std::vector<void*> dummy_ptrs(indices.size() + 1);
             std::vector<size_t> indices_vec(indices.begin(), indices.end());
             std::vector<void*> ptrs_vec(indices.size()); 
             
