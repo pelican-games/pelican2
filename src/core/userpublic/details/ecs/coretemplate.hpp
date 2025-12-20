@@ -226,11 +226,17 @@ class ECSCoreTemplatePublic {
             }
         }
 
+        is_execution_order_dirty = true;
         return id;
     }
     void unregisterSystem(SystemId system_id);
 
     void update();
+
+  private:
+    void rebuildExecutionOrder();
+    std::vector<std::vector<SystemId>> cached_execution_levels;
+    bool is_execution_order_dirty = true;
 };
 
 } // namespace Pelican

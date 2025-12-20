@@ -302,13 +302,10 @@ void ECSCoreTemplatePublic::unregisterSystem(SystemId system_id) {
         systems.at(depends).depended_by.erase(system_id);
     }
     systems.erase(system_id);
+    is_execution_order_dirty = true;
 }
 
-void ECSCoreTemplatePublic::update() {
-    global_tick++; 
-    JobSystem::Get().init(); 
-
-    TimeProfilerStart("ECS_Update_Sort");
+void ECSCoreTemplatePublic::rebuildExecutionOrder() {
     
     // Level-based Topological Sort
     std::unordered_map<SystemId, size_t> in_degree;
@@ -320,7 +317,7 @@ void ECSCoreTemplatePublic::update() {
         if (d == 0) zero_degree_queue.push(id);
     }
     
-    std::vector<std::vector<SystemId>> execution_levels;
+    cached_execution_levels.clear();
     
     while (!zero_degree_queue.empty()) {
         std::vector<SystemId> current_level;
@@ -331,9 +328,9 @@ void ECSCoreTemplatePublic::update() {
             current_level.push_back(id);
         }
         
-        execution_levels.push_back(std::move(current_level));
+        cached_execution_levels.push_back(std::move(current_level));
         
-        for (const auto& executed_id : execution_levels.back()) {
+        for (const auto& executed_id : cached_execution_levels.back()) {
             for (const auto depended : systems.at(executed_id).depended_by) {
                 in_degree[depended]--;
                 if (in_degree[depended] == 0) {
@@ -342,13 +339,20 @@ void ECSCoreTemplatePublic::update() {
             }
         }
     }
+    is_execution_order_dirty = false;
+}
 
-    TimeProfilerEnd("ECS_Update_Sort");
+void ECSCoreTemplatePublic::update() {
+    global_tick++; 
+    JobSystem::Get().init(); 
 
-    TimeProfilerStart("ECS_Update_Execution");
+    if (is_execution_order_dirty) {
+        rebuildExecutionOrder();
+    }
+
 
     // Execute levels
-    for (const auto& level : execution_levels) {
+    for (const auto& level : cached_execution_levels) {
         if (level.empty()) continue;
         
         for (const auto& sys_id : level) {
@@ -361,8 +365,6 @@ void ECSCoreTemplatePublic::update() {
         
         JobSystem::Get().wait();
     }
-    
-    TimeProfilerEnd("ECS_Update_Execution");
 }
 
 } // namespace Pelican
