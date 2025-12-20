@@ -58,6 +58,22 @@ class ECSCoreTemplatePublic {
     void remove(EntityId id);
     void compaction();
 
+    template <typename T>
+    T* getComponent(EntityId id) {
+        if (id >= id_to_ref.size()) return nullptr;
+        
+        const auto ref = id_to_ref[id];
+        auto &chunk = chunks_storage[ref.chunk_index];
+        
+        ComponentId cid = ComponentIdByType<T>::value;
+        size_t idx = Pelican::internal::getIndexFromComponentId_Ref(cid);
+        
+        if (!chunk.has(idx)) return nullptr;
+        
+        auto ref_c = chunk.getRef(idx);
+        return static_cast<T*>(ref_c.ptr) + ref.array_index;
+    }
+
     // System Management
   private:
     void updateSystemChunkCache(ChunkIndex chunk_index);

@@ -33,9 +33,11 @@ void ECSPredefinedRegistration::reg() {
             GET_MODULE(SimpleModelViewTransformSystem), {});
     GET_MODULE(ECSCore).registerSystemForce<CameraSystem, TransformComponent, CameraComponent>(GET_MODULE(CameraSystem),
                                                                                                {});
+    auto& loc_sys = GET_MODULE(LocalTransformSystem);
+    loc_sys.core = &GET_MODULE(ECSCore);
     GET_MODULE(ECSCore)
         .registerSystemForce<LocalTransformSystem, EntityId, TransformComponent, LocalTransformComponent>(
-            GET_MODULE(LocalTransformSystem), {});
+            loc_sys, {});
 
     GET_MODULE(ECSCore).registerSystemForce<SimpleCollisionSystem, TransformComponent, SphereColliderComponent>(
         GET_MODULE(SimpleCollisionSystem), {});

@@ -100,7 +100,7 @@ void ECSCoreTemplatePublic::updateSystemChunkCache(ChunkIndex chunk_index) {
             .chunk_index = chunk_index,
             .array_index = static_cast<WithinChunkIndex>(first_index + i),
         };
-        entity_ids[i] = id_to_ref.size();
+        entity_ids[first_index + i] = id_to_ref.size();
         id_to_ref.emplace_back(entity_ref);
     }
 

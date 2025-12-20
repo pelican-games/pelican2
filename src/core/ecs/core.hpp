@@ -22,6 +22,11 @@ DECLARE_MODULE(ECSCore) {
     void remove(EntityId id) { sub.remove(id); }
     void compaction() { sub.compaction(); }
 
+    template <typename T>
+    T* getComponent(EntityId id) {
+        return sub.getComponent<T>(id);
+    }
+
     template <class TSystem, class... TComponents>
     SystemId registerSystem(TSystem & system, std::vector<SystemId> && depends_list, bool force_update = false) {
         return sub.registerSystem<TSystem, TComponents...>(system, std::move(depends_list), force_update);
