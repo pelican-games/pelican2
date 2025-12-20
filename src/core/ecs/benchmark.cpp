@@ -101,7 +101,6 @@ struct GlobalCheckSystem {
         // std::cout << "GlobalCheckSystem saw " << total_entities << " entities." << std::endl;
     }
 };
-
 struct CompactionVerificationSystem {
     size_t count_observed = 0;
     void process(std::tuple<TransformComponent*> components, size_t count) {
