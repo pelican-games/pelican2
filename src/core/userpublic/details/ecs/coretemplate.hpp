@@ -60,6 +60,7 @@ class ECSCoreTemplatePublic {
     void remove(EntityId id);
     void compaction();
     size_t getTotalCapacity() const;
+    void getContiguousEntityIds(EntityId start_id, size_t count, std::vector<EntityId>& out_ids);
 
     // System Management
   private:

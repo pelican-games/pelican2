@@ -66,11 +66,6 @@ void ECSCoreTemplatePublic::updateSystemChunkCache(ChunkIndex chunk_index) {
 
     // insert entity
     EntityId entity_id_first = 0; 
-    bool sequential_alloc = (count > 1) || free_indices.empty();
-
-    if (sequential_alloc) {
-         entity_id_first = id_to_ref.size();
-    }
 
     // add new chunk if suitable chunk is not found
     if (chunk_index == UINT32_MAX) {
@@ -109,7 +104,14 @@ void ECSCoreTemplatePublic::updateSystemChunkCache(ChunkIndex chunk_index) {
         uint32_t my_idx = 0;
         uint32_t my_gen = 0;
 
-        if (sequential_alloc) {
+        // Try to recycle first
+        if (!free_indices.empty()) {
+             my_idx = free_indices.back();
+             free_indices.pop_back();
+             id_to_ref[my_idx] = entity_ref;
+             my_gen = entity_generations[my_idx];
+        } else {
+             // Append new
              my_idx = id_to_ref.size();
              id_to_ref.emplace_back(entity_ref);
              // Ensure generation vector matches size
@@ -117,12 +119,6 @@ void ECSCoreTemplatePublic::updateSystemChunkCache(ChunkIndex chunk_index) {
                  entity_generations.resize(my_idx + 1, 0);
              }
              my_gen = 0; 
-        } else {
-             // Recycle
-             my_idx = free_indices.back();
-             free_indices.pop_back();
-             id_to_ref[my_idx] = entity_ref;
-             my_gen = entity_generations[my_idx];
         }
 
         EntityId my_id = (static_cast<EntityId>(my_gen) << 32) | my_idx;
@@ -275,6 +271,30 @@ size_t ECSCoreTemplatePublic::getTotalCapacity() const {
         total += chunk.getCapacityBytes();
     }
     return total;
+}
+
+void ECSCoreTemplatePublic::getContiguousEntityIds(EntityId start_id, size_t count, std::vector<EntityId>& out_ids) {
+    uint32_t index = static_cast<uint32_t>(start_id & 0xFFFFFFFF);
+    if(index >= id_to_ref.size()) return;
+
+    const auto ref = id_to_ref[index];
+    auto& chunk = chunks_storage[ref.chunk_index];
+    
+    // Get EntityId array
+    auto& mgr = GET_MODULE(ComponentInfoManager);
+    size_t entity_id_idx = mgr.getIndexFromComponentId(ComponentIdByType<EntityId>::value);
+    
+    EntityId* ptr = static_cast<EntityId*>(chunk.getRef(entity_id_idx).ptr);
+    
+    // Safety check
+    if (ref.array_index + count > chunk.size()) {
+        // This should not happen if allocated contiguously and not removed yet
+        return; 
+    }
+
+    for(size_t i=0; i<count; ++i) {
+        out_ids.push_back(ptr[ref.array_index + i]);
+    }
 }
 
 void ECSCoreTemplatePublic::unregisterSystem(SystemId system_id) {
