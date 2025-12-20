@@ -308,36 +308,55 @@ void ECSCoreTemplatePublic::unregisterSystem(SystemId system_id) {
 void ECSCoreTemplatePublic::rebuildExecutionOrder() {
     
     // Level-based Topological Sort
-    std::unordered_map<SystemId, size_t> in_degree;
-    std::queue<SystemId> zero_degree_queue; 
+    size_t max_sys_id = system_id_counter + 1;
+    std::vector<size_t> in_degree(max_sys_id, 0);
+    std::vector<SystemId> zero_degree_queue; 
+    zero_degree_queue.reserve(systems.size());
     
     for (const auto &[id, sys] : systems) {
         size_t d = sys.depends_list.size();
-        in_degree[id] = d;
-        if (d == 0) zero_degree_queue.push(id);
+        if (id < max_sys_id) {
+            in_degree[id] = d;
+        }
+        if (d == 0) zero_degree_queue.push_back(id);
     }
     
-    cached_execution_levels.clear();
+    // Reuse cached_execution_levels vectors
+    size_t level_idx = 0;
     
+    // Process queue as a current-level buffer
     while (!zero_degree_queue.empty()) {
-        std::vector<SystemId> current_level;
-        size_t level_size = zero_degree_queue.size();
-        for(size_t i = 0; i < level_size; ++i) {
-            SystemId id = zero_degree_queue.front();
-            zero_degree_queue.pop();
-            current_level.push_back(id);
+        // Ensure level vector exists
+        if (level_idx >= cached_execution_levels.size()) {
+            cached_execution_levels.emplace_back();
         }
         
-        cached_execution_levels.push_back(std::move(current_level));
+        auto& current_level_vec = cached_execution_levels[level_idx];
+        current_level_vec.clear();
+        current_level_vec.reserve(zero_degree_queue.size());
         
-        for (const auto& executed_id : cached_execution_levels.back()) {
+        // Move current batch to cache
+        for(auto id : zero_degree_queue) {
+            current_level_vec.push_back(id);
+        }
+        zero_degree_queue.clear();
+        
+        // Find next level nodes using the just-processed level
+        for (const auto& executed_id : current_level_vec) {
             for (const auto depended : systems.at(executed_id).depended_by) {
-                in_degree[depended]--;
-                if (in_degree[depended] == 0) {
-                    zero_degree_queue.push(depended);
+                if (depended < max_sys_id) {
+                    in_degree[depended]--;
+                    if (in_degree[depended] == 0) {
+                        zero_degree_queue.push_back(depended);
+                    }
                 }
             }
         }
+        
+        level_idx++;
+    }
+    if (level_idx < cached_execution_levels.size()) {
+        cached_execution_levels.resize(level_idx);
     }
     is_execution_order_dirty = false;
 }
