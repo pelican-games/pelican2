@@ -14,6 +14,9 @@ PELICAN_DEFINE_HANDLE(GlobalTextureId, int);
 struct MaterialInfo {
     GlobalShaderId vert_shader, frag_shader;
     GlobalTextureId base_color_texture;
+    GlobalTextureId metallic_roughness_texture;
+    GlobalTextureId normal_texture;
+    GlobalTextureId emissive_texture;
 };
 
 } // namespace Pelican

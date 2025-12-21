@@ -15,5 +15,17 @@ endfunction(embed_shader)
 
 embed_shader(default.vert)
 embed_shader(default.frag)
+embed_shader(fullscreen.vert)
+embed_shader(fullscreen.frag)
+embed_shader(ui.vert)
+embed_shader(ui.frag)
+embed_shader(bloom_blur_h.frag)
+embed_shader(bloom_blur_v.frag)
+embed_shader(bloom_highpass.frag)
+embed_shader(bloom_composite.frag)
+embed_shader(ssao.frag)
+embed_shader(ssao_blur.frag)
+embed_shader(debug_texture.frag)
+
 
 b_embed(pelican_resources default_config.json)
