@@ -141,6 +141,8 @@ struct InternalGltfLoader {
                 dat.pos = getDataFromAccessor<TINYGLTF_TYPE_VEC3, glm::vec3>(it->second);
             if (auto it = primitive.attributes.find("NORMAL"); it != primitive.attributes.end())
                 dat.normal = getDataFromAccessor<TINYGLTF_TYPE_VEC3, glm::vec3>(it->second);
+            if (auto it = primitive.attributes.find("TANGENT"); it != primitive.attributes.end())
+                dat.tangent = getDataFromAccessor<TINYGLTF_TYPE_VEC4, glm::vec4>(it->second);
             if (auto it = primitive.attributes.find("TEXCOORD_0"); it != primitive.attributes.end())
                 dat.texcoord = getDataFromAccessor<TINYGLTF_TYPE_VEC2, glm::vec2>(it->second);
             if (auto it = primitive.attributes.find("COLOR_0"); it != primitive.attributes.end()) {
@@ -190,10 +192,23 @@ struct InternalGltfLoader {
             const auto base_color_texture_index = material.pbrMetallicRoughness.baseColorTexture.index;
             const auto base_color_texture =
                 base_color_texture_index >= 0 ? texture_map[base_color_texture_index] : std_mat.transparentTexture();
+            const auto metallic_roughness_texture_index = material.pbrMetallicRoughness.metallicRoughnessTexture.index;
+            const auto metallic_roughness_texture =
+                metallic_roughness_texture_index >= 0 ? texture_map[metallic_roughness_texture_index] : std_mat.metallicRoughnessDefaultTexture();
+            const auto normal_texture_index = material.normalTexture.index;
+            const auto normal_texture =
+                normal_texture_index >= 0 ? texture_map[normal_texture_index] : std_mat.normalDefaultTexture();
+            const auto emissive_texture_index = material.emissiveTexture.index;
+            const auto emissive_texture =
+                emissive_texture_index >= 0 ? texture_map[emissive_texture_index] : std_mat.emissiveDefaultTexture();
+
             material_map[i] = mat_container.registerMaterial(Pelican::MaterialInfo{
                 .vert_shader = std_mat.standardVertShader(),
                 .frag_shader = std_mat.standardFragShader(),
                 .base_color_texture = base_color_texture,
+                .metallic_roughness_texture = metallic_roughness_texture,
+                .normal_texture = normal_texture,
+                .emissive_texture = emissive_texture
             });
         }
 

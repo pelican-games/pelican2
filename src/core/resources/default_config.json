@@ -2,8 +2,8 @@
   "basic_config": {
     "window_title": "Pelican App",
     "window_size": {
-      "width": 1280,
-      "height": 720
+      "width": 1920,
+      "height": 1080
     },
     "fullscreen": false,
     "framerate": 60,
@@ -15,6 +15,9 @@
     },
     "default_scene_id": "default_scene",
     "scene_data_json": "example_scene_data.json",
-    "asset_data_json": "example_asset_data.json"
+    "asset_data_json": "example_asset_data.json",
+    "rendering_config_json": "main_rendering_config.json",
+    "default_rendering_pass": "main_render",
+    "ui_config_json": "ui_overlay.json"
   }
 }
