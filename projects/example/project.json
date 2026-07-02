@@ -1,4 +1,9 @@
 {
+  "schema": "pelican.project",
+  "version": 1,
+  "name": "example",
+  "generator": "hand-written",
+  "engine_min_version": "0.1.0",
   "basic_config": {
     "window_title": "Pelican App",
     "window_size": {
