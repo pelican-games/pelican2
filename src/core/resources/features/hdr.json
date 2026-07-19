@@ -1,0 +1,26 @@
+{
+  "schema": "pelican.render_feature",
+  "version": 1,
+  "name": "hdr",
+  "passes": [
+    {
+      "insert": "after:tonemap",
+      "pass": {
+        "name": "hdr_tonemap",
+        "type": "fullscreen",
+        "output": {
+          "color": "swapchain",
+          "depth": null
+        },
+        "input": ["scene_ldr_in"],
+        "shader": {
+          "vertex": "engine://tonemap",
+          "fragment": "engine://tonemap"
+        },
+        "color_load_op": "load",
+        "clear_color": [0.0, 0.0, 0.0, 1.0]
+      }
+    }
+  ],
+  "shader_defines": ["PELICAN_FEATURE_HDR"]
+}

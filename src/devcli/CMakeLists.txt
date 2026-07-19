@@ -1,14 +1,21 @@
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PELICAN_INSTALL_DIR})
 add_executable(pelican_cli main.cpp)
+set_target_properties(pelican_cli PROPERTIES CXX_STANDARD 20)
 unset(CMAKE_RUNTIME_OUTPUT_DIRECTORY)
 
-add_subdirectory(resources)
-
-FetchContent_Populate(
-  mustache
-  GIT_REPOSITORY https://github.com/kainjow/Mustache.git
-  GIT_TAG        v4.1
+target_sources(pelican_cli PRIVATE
+  assetscommand.cpp
+  bakecameracommand.cpp
+  distconfig.cpp
+  gltfsceneextract.cpp
+  importcommand.cpp
+  materialcommand.cpp
+  processrunner.cpp
+  projectinit.cpp
+  rulesimport.cpp
+  vrmcommand.cpp
+  ../core/model/vatformat.cpp
+  ../core/model/vrmsemantic.cpp
 )
 
-target_link_libraries(pelican_cli PRIVATE argparse)
-target_include_directories(pelican_cli PRIVATE ${mustache_SOURCE_DIR})
+target_link_libraries(pelican_cli PRIVATE argparse nlohmann_json picosha2 glm pelican_project tinygltf)

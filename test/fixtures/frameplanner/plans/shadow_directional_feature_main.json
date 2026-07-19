@@ -1,0 +1,226 @@
+{
+  "barriers": [
+    {
+      "from": "gbuffer_pass",
+      "kind": "read_after_write",
+      "resource": "gbuffer_albedo",
+      "to": "lighting_pass"
+    },
+    {
+      "from": "gbuffer_pass",
+      "kind": "read_after_write",
+      "resource": "gbuffer_normal",
+      "to": "lighting_pass"
+    },
+    {
+      "from": "gbuffer_pass",
+      "kind": "read_after_write",
+      "resource": "gbuffer_material",
+      "to": "lighting_pass"
+    },
+    {
+      "from": "gbuffer_pass",
+      "kind": "read_after_write",
+      "resource": "gbuffer_worldpos",
+      "to": "lighting_pass"
+    },
+    {
+      "from": "gbuffer_pass",
+      "kind": "read_after_write",
+      "resource": "g_emissive",
+      "to": "lighting_pass"
+    },
+    {
+      "from": "shadow_depth",
+      "kind": "read_after_write",
+      "resource": "shadow_map",
+      "to": "lighting_pass"
+    }
+  ],
+  "graph": "main",
+  "levels": [
+    [
+      "gbuffer_pass"
+    ],
+    [
+      "shadow_depth"
+    ],
+    [
+      "lighting_pass"
+    ],
+    [
+      "__anchor_sprite"
+    ],
+    [
+      "__anchor_post_main"
+    ],
+    [
+      "__anchor_tonemap"
+    ],
+    [
+      "__anchor_post_ldr"
+    ],
+    [
+      "__anchor_pelican_ui"
+    ],
+    [
+      "__anchor_debug_draw"
+    ],
+    [
+      "__anchor_debug_text"
+    ],
+    [
+      "__anchor_imgui"
+    ],
+    [
+      "output_transform"
+    ]
+  ],
+  "nodes": [
+    {
+      "declaration_index": 0,
+      "kind": "render",
+      "level": 0,
+      "name": "gbuffer_pass",
+      "order": 0,
+      "reads": [],
+      "reads_history": [],
+      "writes": [
+        "gbuffer_albedo",
+        "gbuffer_normal",
+        "gbuffer_material",
+        "gbuffer_worldpos",
+        "g_emissive",
+        "offscreen_depth"
+      ]
+    },
+    {
+      "declaration_index": 1,
+      "kind": "render",
+      "level": 1,
+      "name": "shadow_depth",
+      "order": 1,
+      "reads": [],
+      "reads_history": [],
+      "writes": [
+        "shadow_map"
+      ]
+    },
+    {
+      "declaration_index": 2,
+      "kind": "render",
+      "level": 2,
+      "name": "lighting_pass",
+      "order": 2,
+      "reads": [
+        "gbuffer_albedo",
+        "gbuffer_normal",
+        "gbuffer_material",
+        "gbuffer_worldpos",
+        "g_emissive",
+        "ssao_blur",
+        "shadow_map"
+      ],
+      "reads_history": [],
+      "writes": [
+        "lit_color"
+      ]
+    },
+    {
+      "declaration_index": 3,
+      "kind": "anchor",
+      "level": 3,
+      "name": "__anchor_sprite",
+      "order": 3,
+      "reads": [],
+      "reads_history": [],
+      "writes": []
+    },
+    {
+      "declaration_index": 4,
+      "kind": "anchor",
+      "level": 4,
+      "name": "__anchor_post_main",
+      "order": 4,
+      "reads": [],
+      "reads_history": [],
+      "writes": []
+    },
+    {
+      "declaration_index": 5,
+      "kind": "anchor",
+      "level": 5,
+      "name": "__anchor_tonemap",
+      "order": 5,
+      "reads": [],
+      "reads_history": [],
+      "writes": []
+    },
+    {
+      "declaration_index": 6,
+      "kind": "anchor",
+      "level": 6,
+      "name": "__anchor_post_ldr",
+      "order": 6,
+      "reads": [],
+      "reads_history": [],
+      "writes": []
+    },
+    {
+      "declaration_index": 7,
+      "kind": "anchor",
+      "level": 7,
+      "name": "__anchor_pelican_ui",
+      "order": 7,
+      "reads": [],
+      "reads_history": [],
+      "writes": []
+    },
+    {
+      "declaration_index": 8,
+      "kind": "anchor",
+      "level": 8,
+      "name": "__anchor_debug_draw",
+      "order": 8,
+      "reads": [],
+      "reads_history": [],
+      "writes": []
+    },
+    {
+      "declaration_index": 9,
+      "kind": "anchor",
+      "level": 9,
+      "name": "__anchor_debug_text",
+      "order": 9,
+      "reads": [],
+      "reads_history": [],
+      "writes": []
+    },
+    {
+      "declaration_index": 10,
+      "kind": "anchor",
+      "level": 10,
+      "name": "__anchor_imgui",
+      "order": 10,
+      "reads": [],
+      "reads_history": [],
+      "writes": []
+    },
+    {
+      "declaration_index": 11,
+      "kind": "output_transform",
+      "level": 11,
+      "name": "output_transform",
+      "order": 11,
+      "reads": [
+        "display"
+      ],
+      "reads_history": [],
+      "writes": [
+        "swapchain"
+      ]
+    }
+  ],
+  "schema": "pelican.frame_plan",
+  "version": 1
+}

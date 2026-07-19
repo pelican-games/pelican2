@@ -6,19 +6,16 @@
 
 #include "transform.hpp"
 #include <components/localtransform.hpp>
+#include <components/predefined.hpp>
 
 namespace Pelican {
 
 DECLARE_MODULE(LocalTransformSystem) {
-    struct TempTransform {
-        LocalTransformComponent *local;
-        TransformComponent *dst_ptr;
-    };
-    std::vector<TempTransform> tmpbuf;
-    std::vector<bool> tmpappearbuf;
+    ECSCoreTemplatePublic *ecs = nullptr;
 
   public:
     using Query = std::span<ChunkView<EntityId, TransformComponent, LocalTransformComponent>>;
+    void prepareEcsWorkerDependencies(bool has_matching_chunks);
     void process(Query chunks);
 };
 

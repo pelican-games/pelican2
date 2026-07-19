@@ -1,0 +1,684 @@
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+
+#include "../src/core/appflow/enginetime.hpp"
+#include "../src/core/communication/rpcserver.hpp"
+#include "../src/core/openxr/openxrsession.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <deque>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+namespace {
+
+struct FakeEvent {
+    XrStructureType type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED;
+    XrSessionState state = XR_SESSION_STATE_UNKNOWN;
+};
+
+struct FakeRuntime {
+    std::string failure;
+    std::vector<std::string> calls;
+    std::deque<FakeEvent> events;
+    bool should_render = true;
+    XrResult begin_frame_result = XR_SUCCESS;
+    bool last_end_was_zero_layer = false;
+    uint32_t update_count = 0;
+    std::vector<XrReferenceSpaceType> supported_spaces{
+        XR_REFERENCE_SPACE_TYPE_LOCAL};
+    XrReferenceSpaceType created_space = XR_REFERENCE_SPACE_TYPE_MAX_ENUM;
+};
+
+thread_local FakeRuntime *active_fake = nullptr;
+
+struct FakeScope {
+    explicit FakeScope(FakeRuntime &fake) { active_fake = &fake; }
+    ~FakeScope() { active_fake = nullptr; }
+};
+
+XrInstance fakeInstance() { return reinterpret_cast<XrInstance>(std::uintptr_t{0x101}); }
+XrSession fakeSession() { return reinterpret_cast<XrSession>(std::uintptr_t{0x301}); }
+XrSpace fakeSpace() { return reinterpret_cast<XrSpace>(std::uintptr_t{0x401}); }
+VkInstance fakeVkInstance() { return reinterpret_cast<VkInstance>(std::uintptr_t{0x501}); }
+VkPhysicalDevice fakeVkPhysicalDevice() {
+    return reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x502});
+}
+VkDevice fakeVkDevice() { return reinterpret_cast<VkDevice>(std::uintptr_t{0x503}); }
+
+XrResult XRAPI_CALL fakeCreateSession(XrInstance instance, const XrSessionCreateInfo *info,
+                                      XrSession *session) {
+    active_fake->calls.emplace_back("create_session");
+    CHECK(instance == fakeInstance());
+    CHECK(info->systemId == 17);
+    const auto *binding = static_cast<const XrGraphicsBindingVulkan2KHR *>(info->next);
+    REQUIRE(binding != nullptr);
+    CHECK(binding->type == XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR);
+    // These are opaque protocol tokens.  The fixture never submits them (or a
+    // fake VkImage) to Vulkan.
+    CHECK(binding->instance == fakeVkInstance());
+    CHECK(binding->physicalDevice == fakeVkPhysicalDevice());
+    CHECK(binding->device == fakeVkDevice());
+    CHECK(binding->queueFamilyIndex == 7);
+    CHECK(binding->queueIndex == 0);
+    if (active_fake->failure == "create_session") return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+    *session = fakeSession();
+    return XR_SUCCESS;
+}
+
+XrResult XRAPI_CALL fakeDestroySession(XrSession session) {
+    active_fake->calls.emplace_back("destroy_session");
+    CHECK(session == fakeSession());
+    return XR_SUCCESS;
+}
+
+XrResult XRAPI_CALL fakeCreateReferenceSpace(XrSession session,
+                                             const XrReferenceSpaceCreateInfo *info,
+                                             XrSpace *space) {
+    active_fake->calls.emplace_back("create_reference_space");
+    CHECK(session == fakeSession());
+    active_fake->created_space = info->referenceSpaceType;
+    CHECK(info->poseInReferenceSpace.orientation.w == 1.0F);
+    if (active_fake->failure == "create_reference_space") return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+    *space = fakeSpace();
+    return XR_SUCCESS;
+}
+
+XrResult XRAPI_CALL fakeEnumerateReferenceSpaces(
+    XrSession session, uint32_t capacity, uint32_t *count,
+    XrReferenceSpaceType *spaces) {
+    active_fake->calls.emplace_back(capacity == 0 ? "enumerate_spaces_count"
+                                                   : "enumerate_spaces_values");
+    CHECK(session == fakeSession());
+    if (active_fake->failure == "enumerate_reference_spaces") {
+        return XR_ERROR_RUNTIME_FAILURE;
+    }
+    *count = static_cast<uint32_t>(active_fake->supported_spaces.size());
+    if (capacity != 0) {
+        REQUIRE(capacity >= active_fake->supported_spaces.size());
+        std::copy(active_fake->supported_spaces.begin(),
+                  active_fake->supported_spaces.end(), spaces);
+    }
+    return XR_SUCCESS;
+}
+
+XrResult XRAPI_CALL fakeDestroySpace(XrSpace space) {
+    active_fake->calls.emplace_back("destroy_space");
+    CHECK(space == fakeSpace());
+    return XR_SUCCESS;
+}
+
+XrResult XRAPI_CALL fakePollEvent(XrInstance instance, XrEventDataBuffer *event) {
+    active_fake->calls.emplace_back("poll_event");
+    CHECK(instance == fakeInstance());
+    if (active_fake->failure == "poll_event") return XR_ERROR_RUNTIME_FAILURE;
+    if (active_fake->events.empty()) return XR_EVENT_UNAVAILABLE;
+
+    const auto next = active_fake->events.front();
+    active_fake->events.pop_front();
+    if (next.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
+        XrEventDataInstanceLossPending loss{XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING};
+        loss.lossTime = 9001;
+        *reinterpret_cast<XrEventDataInstanceLossPending *>(event) = loss;
+    } else {
+        XrEventDataSessionStateChanged changed{XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED};
+        changed.session = fakeSession();
+        changed.state = next.state;
+        changed.time = 8001;
+        *reinterpret_cast<XrEventDataSessionStateChanged *>(event) = changed;
+    }
+    return XR_SUCCESS;
+}
+
+XrResult XRAPI_CALL fakeBeginSession(XrSession session, const XrSessionBeginInfo *info) {
+    active_fake->calls.emplace_back("begin_session");
+    CHECK(session == fakeSession());
+    CHECK(info->primaryViewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO);
+    return active_fake->failure == "begin_session" ? XR_ERROR_SESSION_NOT_READY : XR_SUCCESS;
+}
+
+XrResult XRAPI_CALL fakeEndSession(XrSession session) {
+    active_fake->calls.emplace_back("end_session");
+    CHECK(session == fakeSession());
+    return active_fake->failure == "end_session" ? XR_ERROR_SESSION_NOT_STOPPING : XR_SUCCESS;
+}
+
+XrResult XRAPI_CALL fakeWaitFrame(XrSession session, const XrFrameWaitInfo *,
+                                  XrFrameState *state) {
+    active_fake->calls.emplace_back("wait_frame");
+    CHECK(session == fakeSession());
+    if (active_fake->failure == "wait_frame") return XR_ERROR_RUNTIME_FAILURE;
+    state->predictedDisplayTime = 1'234'567;
+    state->predictedDisplayPeriod = 11'111'111;
+    state->shouldRender = active_fake->should_render ? XR_TRUE : XR_FALSE;
+    return XR_SUCCESS;
+}
+
+XrResult XRAPI_CALL fakeBeginFrame(XrSession session, const XrFrameBeginInfo *) {
+    active_fake->calls.emplace_back("begin_frame");
+    CHECK(session == fakeSession());
+    return active_fake->failure == "begin_frame" ? XR_ERROR_RUNTIME_FAILURE
+                                                   : active_fake->begin_frame_result;
+}
+
+#ifdef _WIN32
+XrResult XRAPI_CALL fakeConvertTimeToPerformanceCounter(
+    XrInstance instance, XrTime, LARGE_INTEGER *counter) {
+    active_fake->calls.emplace_back("convert_time_to_qpc");
+    CHECK(instance == fakeInstance());
+    LARGE_INTEGER now{};
+    LARGE_INTEGER frequency{};
+    REQUIRE(QueryPerformanceCounter(&now));
+    REQUIRE(QueryPerformanceFrequency(&frequency));
+    counter->QuadPart = now.QuadPart + frequency.QuadPart / 100;
+    return XR_SUCCESS;
+}
+#endif
+
+XrResult XRAPI_CALL fakeEndFrame(XrSession session, const XrFrameEndInfo *info) {
+    active_fake->calls.emplace_back("end_frame");
+    CHECK(session == fakeSession());
+    CHECK(info->displayTime == 1'234'567);
+    CHECK(info->environmentBlendMode == XR_ENVIRONMENT_BLEND_MODE_OPAQUE);
+    active_fake->last_end_was_zero_layer = info->layerCount == 0 && info->layers == nullptr;
+    if (active_fake->failure == "end_frame") return XR_ERROR_RUNTIME_FAILURE;
+    return XR_SUCCESS;
+}
+
+XrResult XRAPI_CALL fakeLocateViews(XrSession session, const XrViewLocateInfo *info,
+                                    XrViewState *state, uint32_t capacity, uint32_t *count,
+                                    XrView *views) {
+    active_fake->calls.emplace_back("locate_views");
+    CHECK(session == fakeSession());
+    CHECK(info->viewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO);
+    CHECK(info->displayTime == 1'234'567);
+    CHECK(info->space == fakeSpace());
+    REQUIRE(capacity >= 2);
+    *count = 2;
+    state->viewStateFlags = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT;
+    views[0].pose.position.x = -0.032F;
+    views[1].pose.position.x = 0.032F;
+    return XR_SUCCESS;
+}
+
+PFN_xrVoidFunction fakeFunction(const std::string &name) {
+    if (name == "xrCreateSession") return reinterpret_cast<PFN_xrVoidFunction>(&fakeCreateSession);
+    if (name == "xrDestroySession") return reinterpret_cast<PFN_xrVoidFunction>(&fakeDestroySession);
+    if (name == "xrPollEvent") return reinterpret_cast<PFN_xrVoidFunction>(&fakePollEvent);
+    if (name == "xrBeginSession") return reinterpret_cast<PFN_xrVoidFunction>(&fakeBeginSession);
+    if (name == "xrEndSession") return reinterpret_cast<PFN_xrVoidFunction>(&fakeEndSession);
+    if (name == "xrWaitFrame") return reinterpret_cast<PFN_xrVoidFunction>(&fakeWaitFrame);
+    if (name == "xrBeginFrame") return reinterpret_cast<PFN_xrVoidFunction>(&fakeBeginFrame);
+    if (name == "xrEndFrame") return reinterpret_cast<PFN_xrVoidFunction>(&fakeEndFrame);
+    if (name == "xrLocateViews") return reinterpret_cast<PFN_xrVoidFunction>(&fakeLocateViews);
+    if (name == "xrEnumerateReferenceSpaces")
+        return reinterpret_cast<PFN_xrVoidFunction>(&fakeEnumerateReferenceSpaces);
+    if (name == "xrCreateReferenceSpace")
+        return reinterpret_cast<PFN_xrVoidFunction>(&fakeCreateReferenceSpace);
+    if (name == "xrDestroySpace") return reinterpret_cast<PFN_xrVoidFunction>(&fakeDestroySpace);
+#ifdef _WIN32
+    if (name == "xrConvertTimeToWin32PerformanceCounterKHR")
+        return reinterpret_cast<PFN_xrVoidFunction>(&fakeConvertTimeToPerformanceCounter);
+#endif
+    return nullptr;
+}
+
+XrResult XRAPI_CALL fakeGetInstanceProcAddr(XrInstance instance, const char *name,
+                                            PFN_xrVoidFunction *function) {
+    CHECK(instance == fakeInstance());
+    active_fake->calls.emplace_back(std::string{"resolve:"} + name);
+    if (active_fake->failure == std::string{"resolve:"} + name) {
+        *function = nullptr;
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+    *function = fakeFunction(name);
+    return *function == nullptr ? XR_ERROR_FUNCTION_UNSUPPORTED : XR_SUCCESS;
+}
+
+Pelican::OpenXr::XrSessionDependencies fakeDependencies() {
+    return {
+        .get_instance_proc_addr = &fakeGetInstanceProcAddr,
+        .instance = fakeInstance(),
+        .system_id = 17,
+        .vulkan_instance = fakeVkInstance(),
+        .vulkan_physical_device = fakeVkPhysicalDevice(),
+        .vulkan_device = fakeVkDevice(),
+        .graphics_queue_family_index = 7,
+        .graphics_queue_index = 0,
+    };
+}
+
+void pushState(FakeRuntime &fake, XrSessionState state) {
+    fake.events.push_back({XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED, state});
+}
+
+void makeReady(FakeRuntime &fake, Pelican::OpenXr::SessionRuntime &runtime) {
+    pushState(fake, XR_SESSION_STATE_READY);
+    runtime.pollEvents();
+    REQUIRE(runtime.isSessionRunning());
+    fake.calls.clear();
+}
+
+} // namespace
+
+TEST_CASE("OpenXR session dispatch, lifecycle, and explicit state gates have a stable trace",
+          "[openxr][session]") {
+    FakeRuntime fake;
+    FakeScope scope{fake};
+    {
+        Pelican::OpenXr::SessionRuntime runtime{fakeDependencies()};
+        const std::vector<std::string> expected_setup{
+            "resolve:xrCreateSession",       "resolve:xrDestroySession",
+            "resolve:xrPollEvent",           "resolve:xrBeginSession",
+            "resolve:xrEndSession",          "resolve:xrWaitFrame",
+            "resolve:xrBeginFrame",          "resolve:xrEndFrame",
+            "resolve:xrLocateViews",         "resolve:xrEnumerateReferenceSpaces",
+            "resolve:xrCreateReferenceSpace", "resolve:xrDestroySpace",
+            "create_session",                "enumerate_spaces_count",
+            "enumerate_spaces_values",
+            "create_reference_space",
+        };
+        CHECK(fake.calls == expected_setup);
+        CHECK(fake.created_space == XR_REFERENCE_SPACE_TYPE_LOCAL);
+        const auto space_status = runtime.referenceSpaceStatus();
+        CHECK(std::string{space_status.reference_space} == "LOCAL");
+        CHECK(std::string{space_status.floor_semantics} ==
+              "floor_not_guaranteed");
+        CHECK_FALSE(space_status.floor_level_guaranteed);
+        CHECK(space_status.applied_floor_offset_m == 0.0F);
+
+        // FOCUSED is not a numeric running gate: without a successful READY /
+        // xrBeginSession transition the session remains stopped.
+        fake.calls.clear();
+        pushState(fake, XR_SESSION_STATE_FOCUSED);
+        runtime.pollEvents();
+        CHECK_FALSE(runtime.isSessionRunning());
+        CHECK_FALSE(runtime.isInputEligible());
+        CHECK(fake.calls == std::vector<std::string>{"poll_event", "poll_event"});
+
+        fake.calls.clear();
+        pushState(fake, XR_SESSION_STATE_READY);
+        runtime.pollEvents();
+        CHECK(runtime.isSessionRunning());
+        CHECK_FALSE(runtime.isInputEligible());
+        CHECK(fake.calls ==
+              std::vector<std::string>{"poll_event", "begin_session", "poll_event"});
+
+        for (const auto state : {XR_SESSION_STATE_SYNCHRONIZED, XR_SESSION_STATE_VISIBLE,
+                                 XR_SESSION_STATE_FOCUSED}) {
+            fake.calls.clear();
+            pushState(fake, state);
+            runtime.pollEvents();
+            CHECK(runtime.isSessionRunning());
+            CHECK(runtime.isInputEligible() == (state == XR_SESSION_STATE_FOCUSED));
+            CHECK(fake.calls == std::vector<std::string>{"poll_event", "poll_event"});
+        }
+
+        // A runtime focus hand-off keeps the session running but revokes input;
+        // the returning FOCUSED event restores eligibility without recreating
+        // the session.
+        fake.calls.clear();
+        pushState(fake, XR_SESSION_STATE_VISIBLE);
+        runtime.pollEvents();
+        CHECK(runtime.isSessionRunning());
+        CHECK_FALSE(runtime.isInputEligible());
+        pushState(fake, XR_SESSION_STATE_FOCUSED);
+        runtime.pollEvents();
+        CHECK(runtime.isSessionRunning());
+        CHECK(runtime.isInputEligible());
+
+        fake.calls.clear();
+        pushState(fake, XR_SESSION_STATE_STOPPING);
+        runtime.pollEvents();
+        CHECK_FALSE(runtime.isSessionRunning());
+        CHECK(fake.calls ==
+              std::vector<std::string>{"poll_event", "end_session", "poll_event"});
+
+        fake.calls.clear();
+        pushState(fake, XR_SESSION_STATE_IDLE);
+        runtime.pollEvents();
+        CHECK_FALSE(runtime.isSessionRunning());
+        CHECK_FALSE(runtime.isInputEligible());
+        CHECK(fake.calls == std::vector<std::string>{"poll_event", "poll_event"});
+
+        fake.calls.clear();
+        pushState(fake, XR_SESSION_STATE_LOSS_PENDING);
+        runtime.pollEvents();
+        CHECK(runtime.terminalPath() == Pelican::OpenXr::XrTerminalPath::loss_pending);
+        CHECK(fake.calls == std::vector<std::string>{"poll_event"});
+    }
+    CHECK(fake.calls[fake.calls.size() - 2] == "destroy_space");
+    CHECK(fake.calls.back() == "destroy_session");
+}
+
+TEST_CASE("OpenXR terminal events retain distinct paths", "[openxr][session]") {
+    using Pelican::OpenXr::XrTerminalPath;
+
+    SECTION("EXITING") {
+        FakeRuntime fake;
+        FakeScope scope{fake};
+        Pelican::OpenXr::SessionRuntime runtime{fakeDependencies()};
+        fake.calls.clear();
+        pushState(fake, XR_SESSION_STATE_EXITING);
+        runtime.pollEvents();
+        CHECK(runtime.terminalPath() == XrTerminalPath::exiting);
+        CHECK(fake.calls == std::vector<std::string>{"poll_event"});
+    }
+
+    SECTION("instance loss pending") {
+        FakeRuntime fake;
+        FakeScope scope{fake};
+        Pelican::OpenXr::SessionRuntime runtime{fakeDependencies()};
+        fake.calls.clear();
+        fake.events.push_back({XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING,
+                               XR_SESSION_STATE_UNKNOWN});
+        runtime.pollEvents();
+        CHECK(runtime.terminalPath() == XrTerminalPath::instance_loss_pending);
+        CHECK(fake.calls == std::vector<std::string>{"poll_event"});
+    }
+}
+
+TEST_CASE("OpenXR frame timing is immutable simulation-external data and every frame ends zero-layer",
+          "[openxr][session][timing]") {
+    STATIC_REQUIRE_FALSE((std::is_assignable_v<Pelican::OpenXr::XrDisplayTiming &,
+                                                Pelican::OpenXr::XrDisplayTiming>));
+    FakeRuntime fake;
+    FakeScope scope{fake};
+    Pelican::OpenXr::SessionRuntime runtime{fakeDependencies()};
+    makeReady(fake, runtime);
+
+    Pelican::EngineTime engine_time;
+    engine_time.setup(Pelican::EngineTime::Mode::fixed_step, 1.0 / 60.0);
+    const auto revision_before = engine_time.timeSetRevision();
+
+    SECTION("shouldRender false still updates and closes the frame") {
+        fake.should_render = false;
+        const auto frame = Pelican::OpenXr::runSessionFrame(runtime, engine_time, [&] {
+            CHECK(fake.calls == std::vector<std::string>{"wait_frame", "begin_frame"});
+            ++fake.update_count;
+        });
+        CHECK_FALSE(frame.display_timing.shouldRender());
+        CHECK(frame.display_timing.predictedDisplayTime() == 1'234'567);
+        CHECK(frame.located_views.views.empty());
+        CHECK(fake.update_count == 1);
+        CHECK(engine_time.frameIndex() == 1);
+        CHECK(engine_time.timeSetRevision() == revision_before);
+        CHECK(engine_time.now() != static_cast<double>(frame.display_timing.predictedDisplayTime()));
+        CHECK(fake.calls ==
+              std::vector<std::string>{"wait_frame", "begin_frame", "end_frame"});
+        CHECK(fake.last_end_was_zero_layer);
+    }
+
+    SECTION("shouldRender true locates and retains views without drawing") {
+        const auto frame = Pelican::OpenXr::runSessionFrame(runtime, engine_time, [&] {
+            CHECK(fake.calls == std::vector<std::string>{"wait_frame", "begin_frame",
+                                                         "locate_views"});
+            ++fake.update_count;
+        });
+        CHECK(frame.display_timing.shouldRender());
+        CHECK(frame.display_timing.predictedDisplayPeriod() == 11'111'111);
+        REQUIRE(frame.located_views.views.size() == 2);
+        CHECK(frame.located_views.views[0].pose.position.x == -0.032F);
+        CHECK(frame.located_views.views[1].pose.position.x == 0.032F);
+        CHECK(fake.update_count == 1);
+        CHECK(engine_time.timeSetRevision() == revision_before);
+        CHECK(fake.calls == std::vector<std::string>{"wait_frame", "begin_frame",
+                                                     "locate_views", "end_frame"});
+        CHECK(fake.last_end_was_zero_layer);
+    }
+
+    SECTION("XR_FRAME_DISCARDED advances update but skips locate and closes zero-layer") {
+        fake.begin_frame_result = XR_FRAME_DISCARDED;
+        const auto frame = Pelican::OpenXr::runSessionFrame(runtime, engine_time, [&] {
+            ++fake.update_count;
+        });
+        CHECK(frame.begin_result == Pelican::OpenXr::XrBeginFrameResult::discarded);
+        CHECK(frame.located_views.views.empty());
+        CHECK(fake.update_count == 1);
+        CHECK(engine_time.frameIndex() == 1);
+        CHECK(fake.calls ==
+              std::vector<std::string>{"wait_frame", "begin_frame", "end_frame"});
+        CHECK(fake.last_end_was_zero_layer);
+        CHECK(runtime.diagnosticStatus().timing.begin_frame_discarded_count == 1);
+    }
+}
+
+TEST_CASE("OpenXR diagnostic snapshot drives the additive get_status xr schema",
+          "[openxr][session][diagnostic]") {
+    FakeRuntime fake;
+    FakeScope scope{fake};
+    Pelican::OpenXr::SessionRuntime runtime{fakeDependencies()};
+
+    auto status = runtime.diagnosticStatus();
+    CHECK(std::string{status.session_state} == "UNKNOWN");
+    CHECK(std::string{status.view_configuration} == "PRIMARY_STEREO");
+    CHECK(std::string{status.reference_space.reference_space} == "LOCAL");
+    CHECK_FALSE(status.should_render.has_value());
+
+    pushState(fake, XR_SESSION_STATE_READY);
+    pushState(fake, XR_SESSION_STATE_FOCUSED);
+    runtime.pollEvents();
+    fake.should_render = false;
+    const auto hidden_timing = runtime.waitFrame();
+    runtime.beginFrame();
+    runtime.endFrame(hidden_timing);
+
+    status = runtime.diagnosticStatus();
+    const auto hidden_json = Pelican::openXrStatusJsonForTesting(status);
+    CHECK(hidden_json.at("active") == true);
+    CHECK(hidden_json.at("session_state") == "FOCUSED");
+    CHECK(hidden_json.at("view_configuration") == "PRIMARY_STEREO");
+    CHECK(hidden_json.at("reference_space") == "LOCAL");
+    CHECK(hidden_json.at("floor_semantics") == "floor_not_guaranteed");
+    CHECK(hidden_json.at("floor_level_guaranteed") == false);
+    CHECK(hidden_json.at("applied_floor_offset_m") == 0.0F);
+    CHECK(hidden_json.at("should_render") == false);
+
+    fake.should_render = true;
+    const auto visible_timing = runtime.waitFrame();
+    runtime.beginFrame();
+    runtime.endFrame(visible_timing);
+    CHECK(runtime.diagnosticStatus().should_render == true);
+    runtime.recordMirrorStatistics(7, 2, 1);
+    auto timing = runtime.diagnosticStatus().timing;
+    CHECK(timing.wait_frame_count == 2);
+    CHECK(timing.should_render_false_count == 1);
+    CHECK(timing.should_render_false_rate == 0.5);
+    CHECK(timing.begin_frame_discarded_count == 0);
+    CHECK(timing.mirror_presented == 7);
+    CHECK(timing.mirror_dropped == 2);
+    CHECK(timing.mirror_failures == 1);
+
+    fake.begin_frame_result = XR_FRAME_DISCARDED;
+    const auto discarded_timing = runtime.waitFrame();
+    CHECK(runtime.beginFrame() == Pelican::OpenXr::XrBeginFrameResult::discarded);
+    runtime.endFrame(discarded_timing);
+    fake.begin_frame_result = XR_SESSION_LOSS_PENDING;
+    const auto loss_pending_timing = runtime.waitFrame();
+    CHECK(runtime.beginFrame() ==
+          Pelican::OpenXr::XrBeginFrameResult::session_loss_pending);
+    runtime.endFrame(loss_pending_timing);
+
+    timing = runtime.diagnosticStatus().timing;
+    CHECK(timing.begin_frame_discarded_count == 1);
+    CHECK(timing.session_loss_pending_count == 1);
+    const auto counters_json = Pelican::openXrStatusJsonForTesting(
+        runtime.diagnosticStatus()).at("timing");
+    CHECK(counters_json.at("begin_frame_discarded_count") == 1);
+    CHECK(counters_json.at("session_loss_pending_count") == 1);
+    CHECK(counters_json.at("mirror_dropped") == 2);
+}
+
+#ifdef _WIN32
+TEST_CASE("OpenXR QPC margins exist only when the conversion extension is enabled",
+          "[openxr][session][timing][qpc]") {
+    FakeRuntime fake;
+    FakeScope scope{fake};
+    auto dependencies = fakeDependencies();
+    dependencies.win32_time_conversion_enabled = true;
+    Pelican::OpenXr::SessionRuntime runtime{dependencies};
+    makeReady(fake, runtime);
+
+    const auto timing = runtime.waitFrame();
+    runtime.beginFrame();
+    runtime.endFrame(timing);
+    const auto status = runtime.diagnosticStatus().timing;
+    CHECK(status.time_conversion_available);
+    CHECK(status.time_conversion_failures == 0);
+    CHECK(status.after_wait_margin.count == 1);
+    CHECK(status.before_submit_margin.count == 1);
+    CHECK(status.after_end_frame_margin.count == 1);
+    REQUIRE(status.after_wait_margin.median_ms);
+    CHECK(std::isfinite(*status.after_wait_margin.median_ms));
+}
+#endif
+
+TEST_CASE("OpenXR wait, begin, and end frame failures preserve their call boundary",
+          "[openxr][session][error]") {
+    for (const auto *failure : {"wait_frame", "begin_frame", "end_frame"}) {
+        DYNAMIC_SECTION(failure) {
+            FakeRuntime fake;
+            FakeScope scope{fake};
+            Pelican::OpenXr::SessionRuntime runtime{fakeDependencies()};
+            makeReady(fake, runtime);
+            fake.failure = failure;
+
+            Pelican::EngineTime engine_time;
+            engine_time.setup(Pelican::EngineTime::Mode::fixed_step, 1.0 / 60.0);
+            CHECK_THROWS_WITH(
+                Pelican::OpenXr::runSessionFrame(runtime, engine_time,
+                                                 [&] { ++fake.update_count; }),
+                Catch::Matchers::ContainsSubstring(failure == std::string{"wait_frame"}
+                                                       ? "xrWaitFrame"
+                                                       : failure == std::string{"begin_frame"}
+                                                             ? "xrBeginFrame"
+                                                             : "xrEndFrame"));
+
+            if (failure == std::string{"wait_frame"}) {
+                CHECK(fake.calls == std::vector<std::string>{"wait_frame"});
+                CHECK(fake.update_count == 0);
+            } else if (failure == std::string{"begin_frame"}) {
+                CHECK(fake.calls ==
+                      std::vector<std::string>{"wait_frame", "begin_frame"});
+                // WP132 freezes XR poses before update; a failed begin cannot
+                // expose an unlocated pose frame to the simulation.
+                CHECK(fake.update_count == 0);
+            } else {
+                CHECK(fake.calls ==
+                      std::vector<std::string>{"wait_frame", "begin_frame", "locate_views",
+                                               "end_frame"});
+                CHECK(fake.update_count == 1);
+            }
+            CHECK(engine_time.timeSetRevision() == 0);
+        }
+    }
+}
+
+TEST_CASE("synthetic head pose preserves view valid and tracked flags independently",
+          "[openxr][pose][head]") {
+    Pelican::OpenXr::XrLocatedViews views;
+    views.state_flags = XR_VIEW_STATE_ORIENTATION_VALID_BIT |
+                        XR_VIEW_STATE_POSITION_VALID_BIT |
+                        XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
+    views.views = {XrView{XR_TYPE_VIEW}, XrView{XR_TYPE_VIEW}};
+    views.views[0].pose.position = {-0.03F, 1.6F, 0.2F};
+    views.views[1].pose.position = {0.03F, 1.6F, 0.2F};
+    views.views[0].pose.orientation.w = 1.0F;
+    views.views[1].pose.orientation.w = 1.0F;
+
+    const auto pose = Pelican::OpenXr::syntheticHeadPose(
+        views, Pelican::ActionPoseReferenceSpace::local);
+    CHECK(pose.position[0] == 0.0F);
+    CHECK(pose.position[1] == 1.6F);
+    CHECK(pose.position[2] == 0.2F);
+    CHECK(pose.valid);
+    CHECK(pose.orientation_valid);
+    CHECK(pose.position_valid);
+    CHECK(pose.orientation_tracked);
+    CHECK_FALSE(pose.position_tracked);
+    CHECK(pose.source == Pelican::ActionPoseSource::synthetic_head);
+    CHECK(pose.reference_space == Pelican::ActionPoseReferenceSpace::local);
+    CHECK(pose.hand == Pelican::ActionPoseHand::none);
+}
+
+TEST_CASE("OpenXR event and begin/end session failures are fail-fast with explicit running state",
+          "[openxr][session][error]") {
+    SECTION("poll") {
+        FakeRuntime fake;
+        FakeScope scope{fake};
+        Pelican::OpenXr::SessionRuntime runtime{fakeDependencies()};
+        fake.calls.clear();
+        fake.failure = "poll_event";
+        CHECK_THROWS_WITH(runtime.pollEvents(),
+                          Catch::Matchers::ContainsSubstring("xrPollEvent"));
+        CHECK(fake.calls == std::vector<std::string>{"poll_event"});
+    }
+
+    SECTION("begin session") {
+        FakeRuntime fake;
+        FakeScope scope{fake};
+        Pelican::OpenXr::SessionRuntime runtime{fakeDependencies()};
+        fake.calls.clear();
+        fake.failure = "begin_session";
+        pushState(fake, XR_SESSION_STATE_READY);
+        CHECK_THROWS_WITH(runtime.pollEvents(),
+                          Catch::Matchers::ContainsSubstring("xrBeginSession"));
+        CHECK_FALSE(runtime.isSessionRunning());
+        CHECK(fake.calls == std::vector<std::string>{"poll_event", "begin_session"});
+    }
+
+    SECTION("end session") {
+        FakeRuntime fake;
+        FakeScope scope{fake};
+        Pelican::OpenXr::SessionRuntime runtime{fakeDependencies()};
+        makeReady(fake, runtime);
+        fake.failure = "end_session";
+        pushState(fake, XR_SESSION_STATE_STOPPING);
+        CHECK_THROWS_WITH(runtime.pollEvents(),
+                          Catch::Matchers::ContainsSubstring("xrEndSession"));
+        CHECK_FALSE(runtime.isSessionRunning());
+        CHECK(fake.calls == std::vector<std::string>{"poll_event", "end_session"});
+    }
+}
+
+TEST_CASE("OpenXR session dispatch resolution and creation failures do not cross into Vulkan",
+          "[openxr][session][error]") {
+    SECTION("resolution") {
+        FakeRuntime fake{.failure = "resolve:xrWaitFrame"};
+        FakeScope scope{fake};
+        CHECK_THROWS_WITH(Pelican::OpenXr::SessionRuntime{fakeDependencies()},
+                          Catch::Matchers::ContainsSubstring("xrWaitFrame"));
+        CHECK(std::find(fake.calls.begin(), fake.calls.end(), "create_session") ==
+              fake.calls.end());
+    }
+
+    SECTION("session creation") {
+        FakeRuntime fake{.failure = "create_session"};
+        FakeScope scope{fake};
+        CHECK_THROWS_WITH(Pelican::OpenXr::SessionRuntime{fakeDependencies()},
+                          Catch::Matchers::ContainsSubstring("xrCreateSession"));
+        CHECK(fake.calls.back() == "create_session");
+    }
+
+    SECTION("reference space creation unwinds the session") {
+        FakeRuntime fake{.failure = "create_reference_space"};
+        FakeScope scope{fake};
+        CHECK_THROWS_WITH(Pelican::OpenXr::SessionRuntime{fakeDependencies()},
+                          Catch::Matchers::ContainsSubstring("xrCreateReferenceSpace"));
+        CHECK(fake.calls[fake.calls.size() - 2] == "create_reference_space");
+        CHECK(fake.calls.back() == "destroy_session");
+    }
+
+    SECTION("reference space enumeration unwinds the session") {
+        FakeRuntime fake{.failure = "enumerate_reference_spaces"};
+        FakeScope scope{fake};
+        CHECK_THROWS_WITH(Pelican::OpenXr::SessionRuntime{fakeDependencies()},
+                          Catch::Matchers::ContainsSubstring(
+                              "xrEnumerateReferenceSpaces"));
+        CHECK(fake.calls[fake.calls.size() - 2] == "enumerate_spaces_count");
+        CHECK(fake.calls.back() == "destroy_session");
+    }
+}

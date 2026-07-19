@@ -1,5 +1,17 @@
 target_sources(pelican_core PRIVATE
+    assetsverification.cpp
+    engineresources.cpp
+    fileio.cpp
+    imageloader.cpp
+    ktx2.cpp
+    pathresolver.cpp
     projectsrc.cpp
+    authoringscenedocument.cpp
+    componentcodec.cpp
+    editorpreviewprojection.cpp
+    editorprojectiontransaction.cpp
+    editorprojectionadapters.cpp
     basicconfig.cpp
     scene.cpp
+    vrmadecoder.cpp
 )

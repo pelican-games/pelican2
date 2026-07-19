@@ -1,0 +1,1716 @@
+#include "featurecompose.hpp"
+
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace Pelican {
+
+namespace {
+
+constexpr std::string_view feature_schema = "pelican.render_feature";
+constexpr int supported_feature_version = 1;
+constexpr int color_format_resolver_version = 2;
+constexpr std::string_view feature_parameters_schema = "pelican.render_feature_parameters";
+constexpr int supported_feature_parameters_version = 1;
+constexpr std::string_view runtime_compiler_required_message =
+    "render feature には実行時コンパイラが必要です (runtime shader compiler is required)";
+constexpr std::array<std::string_view, 8> canonical_anchors = {
+    "sprite", "post_main", "tonemap", "post_ldr", "pelican_ui", "debug_draw", "debug_text", "imgui"};
+
+std::unordered_set<std::string> collectRenderTargetNames(const nlohmann::json &config);
+
+std::string canonicalAnchorNodeName(std::string_view anchor) {
+    return "__anchor_" + std::string{anchor};
+}
+
+bool isIdentifier(std::string_view value) {
+    if (value.empty() || (std::isalpha(static_cast<unsigned char>(value.front())) == 0 &&
+                          value.front() != '_')) {
+        return false;
+    }
+    return std::all_of(value.begin() + 1, value.end(), [](char ch) {
+        return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_';
+    });
+}
+
+std::string requireStringField(const nlohmann::json &json, std::string_view field_name,
+                               std::string_view context) {
+    const auto it = json.find(field_name);
+    if (it == json.end() || !it->is_string()) {
+        throw std::runtime_error(std::string{context} + " requires string field: " +
+                                 std::string{field_name});
+    }
+    return it->get<std::string>();
+}
+
+const nlohmann::json &requireArrayField(const nlohmann::json &json, std::string_view field_name,
+                                        std::string_view context) {
+    const auto it = json.find(field_name);
+    if (it == json.end() || !it->is_array()) {
+        throw std::runtime_error(std::string{context} + " requires array field: " +
+                                 std::string{field_name});
+    }
+    return it.value();
+}
+
+std::vector<std::string> parseStringArray(const nlohmann::json &json, std::string_view field_name,
+                                          std::string_view context) {
+    const auto &array = requireArrayField(json, field_name, context);
+    std::vector<std::string> values;
+    values.reserve(array.size());
+    for (const auto &entry : array) {
+        if (!entry.is_string()) {
+            throw std::runtime_error(std::string{context} + " requires string array field: " +
+                                     std::string{field_name});
+        }
+        values.push_back(entry.get<std::string>());
+    }
+    return values;
+}
+
+void appendUnique(std::vector<std::string> &values, const std::string &value) {
+    if (std::find(values.begin(), values.end(), value) == values.end()) {
+        values.push_back(value);
+    }
+}
+
+void appendUnique(std::vector<std::string> &values, const std::vector<std::string> &more_values) {
+    for (const auto &value : more_values) {
+        appendUnique(values, value);
+    }
+}
+
+std::string validateFeatureEnvelope(const nlohmann::json &feature, std::string_view ref) {
+    if (!feature.is_object()) {
+        throw std::runtime_error("render feature must be an object: " + std::string{ref});
+    }
+    if (feature.value("schema", std::string{}) != feature_schema) {
+        throw std::runtime_error("render feature schema is not supported: " + std::string{ref});
+    }
+    if (!feature.contains("version") || !feature.at("version").is_number_integer()) {
+        throw std::runtime_error("render feature requires numeric version: " + std::string{ref});
+    }
+    if (feature.at("version").get<int>() != supported_feature_version) {
+        throw std::runtime_error("render feature version is not supported: " + std::string{ref});
+    }
+    return requireStringField(feature, "name", "render feature");
+}
+
+std::optional<nlohmann::json> parseProjectionJitterDeclaration(
+    const nlohmann::json &feature, const std::string &feature_name) {
+    if (!feature.contains("projection_jitter")) {
+        return std::nullopt;
+    }
+    const auto &declaration = feature.at("projection_jitter");
+    if (!declaration.is_object()) {
+        throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                 "' declaration must be an object");
+    }
+    for (auto field = declaration.begin(); field != declaration.end(); ++field) {
+        if (field.key() == "phases_from_scale" || field.key() == "mip_bias" ||
+            field.key() == "render_scale") {
+            throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                     "' uses reserved key: " + field.key());
+        }
+    }
+    if (!declaration.contains("pattern") || !declaration.at("pattern").is_string()) {
+        throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                 "' requires string pattern");
+    }
+    const auto pattern = declaration.at("pattern").get<std::string>();
+    if (pattern != "halton23" && pattern != "table") {
+        throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                 "' has unknown pattern: " + pattern);
+    }
+
+    for (auto field = declaration.begin(); field != declaration.end(); ++field) {
+        const bool allowed = field.key() == "pattern" || field.key() == "phases" ||
+                             (pattern == "table" && field.key() == "offsets_px");
+        if (!allowed) {
+            throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                     "' has unknown key: " + field.key());
+        }
+    }
+
+    const auto parsePhases = [&]() -> std::uint32_t {
+        if (!declaration.contains("phases") || !declaration.at("phases").is_number_integer()) {
+            throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                     "' requires unsigned integer phases");
+        }
+        const auto &phases = declaration.at("phases");
+        const bool in_range = phases.is_number_unsigned()
+                                  ? phases.get<std::uint64_t>() >= 1 &&
+                                        phases.get<std::uint64_t>() <= 64
+                                  : phases.get<std::int64_t>() >= 1 &&
+                                        phases.get<std::int64_t>() <= 64;
+        if (!in_range) {
+            throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                     "' phases must be in range 1..64");
+        }
+        return phases.get<std::uint32_t>();
+    };
+
+    if (pattern == "halton23") {
+        return nlohmann::json{{"provider", feature_name}, {"pattern", pattern},
+                              {"phases", parsePhases()}};
+    }
+
+    if (!declaration.contains("offsets_px") || !declaration.at("offsets_px").is_array()) {
+        throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                 "' table requires offsets_px array");
+    }
+    const auto &offsets = declaration.at("offsets_px");
+    if (offsets.empty() || offsets.size() > 64) {
+        throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                 "' offsets_px length must be in range 1..64");
+    }
+    for (std::size_t index = 0; index < offsets.size(); ++index) {
+        const auto &offset = offsets.at(index);
+        if (!offset.is_array() || offset.size() != 2) {
+            throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                     "' offsets_px[" + std::to_string(index) +
+                                     "] must contain exactly two numbers");
+        }
+        for (std::size_t component = 0; component < 2; ++component) {
+            const auto &value = offset.at(component);
+            if (!value.is_number()) {
+                throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                         "' offsets_px[" + std::to_string(index) + "][" +
+                                         std::to_string(component) + "] must be a finite number");
+            }
+            const auto number = value.get<double>();
+            if (!std::isfinite(number)) {
+                throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                         "' offsets_px[" + std::to_string(index) + "][" +
+                                         std::to_string(component) + "] must be finite");
+            }
+            if (number < -0.5 || number >= 0.5) {
+                throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                         "' offsets_px[" + std::to_string(index) + "][" +
+                                         std::to_string(component) +
+                                         "] must be in range [-0.5, 0.5)");
+            }
+        }
+    }
+
+    const auto phases = static_cast<std::uint32_t>(offsets.size());
+    if (declaration.contains("phases") && parsePhases() != phases) {
+        throw std::runtime_error("projection_jitter provider '" + feature_name +
+                                 "' phases must match offsets_px length " +
+                                 std::to_string(phases));
+    }
+    return nlohmann::json{{"provider", feature_name}, {"pattern", pattern},
+                          {"phases", phases}, {"offsets_px", offsets}};
+}
+
+nlohmann::json loadFeatureJson(std::string_view ref,
+                               const RenderFeatureComposeDependencies &dependencies) {
+    if (!dependencies.load_feature_json) {
+        throw std::runtime_error("render feature loader is not configured: " + std::string{ref});
+    }
+    return nlohmann::json::parse(dependencies.load_feature_json(ref));
+}
+
+struct FeatureInstance {
+    std::string ref;
+    nlohmann::json parameters = nlohmann::json::object();
+};
+
+std::vector<FeatureInstance> parseFeatureInstances(const nlohmann::json &config) {
+    if (!config.contains("features")) {
+        return {};
+    }
+    const auto &features = config.at("features");
+    if (!features.is_array()) {
+        throw std::runtime_error("rendering config features must be an array");
+    }
+
+    std::vector<FeatureInstance> instances;
+    instances.reserve(features.size());
+    for (const auto &entry : features) {
+        if (entry.is_string()) {
+            instances.push_back(FeatureInstance{entry.get<std::string>(), nlohmann::json::object()});
+            continue;
+        }
+        if (!entry.is_object()) {
+            throw std::runtime_error(
+                "rendering config features entries must be strings or {ref, parameters} objects");
+        }
+        for (auto field = entry.begin(); field != entry.end(); ++field) {
+            if (field.key() != "ref" && field.key() != "parameters") {
+                throw std::runtime_error("render feature instance has unknown field: " + field.key());
+            }
+        }
+        const auto ref = requireStringField(entry, "ref", "render feature instance");
+        const auto parameters = entry.value("parameters", nlohmann::json::object());
+        if (!parameters.is_object()) {
+            throw std::runtime_error("render feature instance parameters must be an object: " + ref);
+        }
+        instances.push_back(FeatureInstance{ref, parameters});
+    }
+    return instances;
+}
+
+nlohmann::json &ensureArray(nlohmann::json &config, std::string_view field_name) {
+    const auto field = std::string{field_name};
+    if (!config.contains(field)) {
+        config[field] = nlohmann::json::array();
+    }
+    if (!config.at(field).is_array()) {
+        throw std::runtime_error("rendering config " + field + " must be an array");
+    }
+    return config.at(field);
+}
+
+bool stringListContains(const nlohmann::json &value, std::string_view needle) {
+    if (value.is_string()) {
+        return value.get<std::string>() == needle;
+    }
+    if (!value.is_array()) {
+        return false;
+    }
+    return std::any_of(value.begin(), value.end(), [needle](const auto &entry) {
+        return entry.is_string() && entry.get<std::string>() == needle;
+    });
+}
+
+bool passWritesSwapchain(const nlohmann::json &pass) {
+    return pass.contains("output") && pass.at("output").is_object() &&
+           pass.at("output").contains("color") &&
+           stringListContains(pass.at("output").at("color"), "swapchain");
+}
+
+void replaceSwapchainAlias(nlohmann::json &value) {
+    if (value.is_string()) {
+        if (value.get<std::string>() == "swapchain") {
+            value = "display";
+        }
+        return;
+    }
+    if (!value.is_array()) {
+        return;
+    }
+    for (auto &entry : value) {
+        replaceSwapchainAlias(entry);
+    }
+}
+
+std::string inferFormatClass(const nlohmann::json &target) {
+    const auto name = target.value("name", std::string{});
+    const auto format = target.value("format", std::string{});
+    if (name == "display") {
+        return "display";
+    }
+    if (format.rfind("D", 0) == 0 || format == "R8_UNORM" ||
+        name.find("normal") != std::string::npos || name.find("material") != std::string::npos ||
+        name.find("worldpos") != std::string::npos || name.find("ssao") != std::string::npos ||
+        name.find("depth") != std::string::npos || name.find("shadow") != std::string::npos) {
+        return "data";
+    }
+    if (name == "gbuffer_albedo" || name == "g_emissive" || name == "lit_color" ||
+        name.rfind("Bloom_", 0) == 0) {
+        return "scene";
+    }
+    return "explicit(" + format + ")";
+}
+
+void addFormatClassesAndDisplay(nlohmann::json &config) {
+    auto &targets = ensureArray(config, "render_targets");
+    bool has_display = false;
+    for (auto &target : targets) {
+        if (!target.is_object()) {
+            throw std::runtime_error("render_targets entries must be objects");
+        }
+        if (target.value("name", std::string{}) == "display") {
+            has_display = true;
+        }
+        if (!target.contains("format_class")) {
+            target["format_class"] = inferFormatClass(target);
+        }
+        if (!target.contains("role")) {
+            const auto format_class = target.at("format_class").get<std::string>();
+            target["role"] = (format_class == "scene" || format_class == "display") ? "color" : "data";
+        }
+    }
+    if (has_display) {
+        throw std::runtime_error("Render target name is reserved by the canonical color pipeline: display");
+    }
+    targets.push_back({
+        {"name", "display"},
+        {"extent_scale", 1.0},
+        {"format", "B8G8R8A8_SRGB"},
+        {"format_class", "display"},
+        {"role", "color"},
+        {"usage", nlohmann::json::array({"COLOR_ATTACHMENT", "SAMPLED", "TRANSFER_SRC"})},
+    });
+}
+
+size_t canonicalBucket(const nlohmann::json &pass, bool hdr_enabled) {
+    const auto type = pass.value("type", std::string{});
+    if (type == "ui") {
+        return 4;
+    }
+    if (type == "debug_draw") {
+        return 5;
+    }
+    if (type == "debug_text") {
+        return 6;
+    }
+    if (pass.contains("canonical_anchor") && pass.at("canonical_anchor").is_string()) {
+        const auto requested = pass.at("canonical_anchor").get<std::string>();
+        const auto found = std::find(canonical_anchors.begin(), canonical_anchors.end(), requested);
+        if (found == canonical_anchors.end()) {
+            throw std::runtime_error("Unknown canonical pass anchor: " + requested);
+        }
+        return static_cast<size_t>(std::distance(canonical_anchors.begin(), found));
+    }
+    const auto name = pass.value("name", std::string{});
+    if (name == "lighting_pass") {
+        return canonical_anchors.size();
+    }
+    const bool bloom = name == "HighLuminanceExtraction" || name == "FinalBloomComposite" ||
+                       name.rfind("HorizontalBlur_", 0) == 0 || name.rfind("VerticalBlur_", 0) == 0 ||
+                       name.rfind("UpsampleBlend_", 0) == 0;
+    if (bloom || passWritesSwapchain(pass)) {
+        return hdr_enabled ? 1 : 3;
+    }
+    return canonical_anchors.size(); // scene passes, before post_main
+}
+
+nlohmann::json makeAnchor(std::string_view anchor) {
+    return {
+        {"name", canonicalAnchorNodeName(anchor)},
+        {"type", "canonical_anchor"},
+        {"anchor", anchor},
+    };
+}
+
+nlohmann::json makeOutputTransform() {
+    return {
+        {"name", "output_transform"},
+        {"type", "output_transform"},
+        {"input", nlohmann::json::array({"display"})},
+        {"output", {{"color", "swapchain"}, {"depth", nullptr}}},
+        {"shader", {{"vertex", "engine://fullscreen"},
+                    {"fragment", "engine://output_transform"}}},
+        {"color_load_op", "dont_care"},
+    };
+}
+
+void prepareHdrSceneOutput(nlohmann::json &config) {
+    auto &targets = ensureArray(config, "render_targets");
+    targets.push_back({
+        {"name", "scene_ldr_in"},
+        {"extent_scale", 1.0},
+        {"format", "B8G8R8A8_UNORM"},
+        {"format_class", "scene"},
+        {"role", "color"},
+        {"usage", nlohmann::json::array({"COLOR_ATTACHMENT", "SAMPLED"})},
+    });
+
+    nlohmann::json *scene_terminal = nullptr;
+    for (auto &pass_set : ensureArray(config, "rendering_passes")) {
+        for (auto &pass : pass_set.at("passes")) {
+            const auto type = pass.value("type", std::string{});
+            if (type != "ui" && type != "debug_draw" && type != "debug_text" &&
+                passWritesSwapchain(pass)) {
+                scene_terminal = &pass;
+            }
+        }
+    }
+    if (scene_terminal == nullptr) {
+        throw std::runtime_error("HDR canonical pipeline requires a scene pass that writes swapchain/display");
+    }
+    replaceSwapchainAlias(scene_terminal->at("output").at("color"));
+    auto &output = scene_terminal->at("output").at("color");
+    if (output.is_string()) {
+        output = "scene_ldr_in";
+    } else {
+        for (auto &entry : output) {
+            if (entry == "display") {
+                entry = "scene_ldr_in";
+            }
+        }
+    }
+}
+
+void appendAfter(nlohmann::json &node, const std::string &dependency) {
+    if (!node.contains("after")) {
+        node["after"] = nlohmann::json::array();
+    } else if (node.at("after").is_string()) {
+        node["after"] = nlohmann::json::array({node.at("after")});
+    }
+    if (!node.at("after").is_array()) {
+        throw std::runtime_error("canonical frame pass after must be a string or array");
+    }
+    auto &after = node.at("after");
+    if (std::find(after.begin(), after.end(), dependency) == after.end()) {
+        after.push_back(dependency);
+    }
+}
+
+bool hasExplicitRelation(const nlohmann::json &lhs, const std::string &rhs_name) {
+    return (lhs.contains("after") && stringListContains(lhs.at("after"), rhs_name)) ||
+           (lhs.contains("before") && stringListContains(lhs.at("before"), rhs_name));
+}
+
+void enforceCanonicalOrder(nlohmann::json &passes) {
+    std::string active_anchor;
+    std::vector<std::string> active_passes;
+    nlohmann::json *last_active_pass = nullptr;
+    for (auto &pass : passes) {
+        const auto type = pass.value("type", std::string{});
+        const auto name = requireStringField(pass, "name", "canonical frame node");
+        if (type == "canonical_anchor") {
+            if (!active_anchor.empty()) {
+                appendAfter(pass, active_anchor);
+            }
+            for (const auto &active_pass : active_passes) {
+                appendAfter(pass, active_pass);
+            }
+            active_anchor = name;
+            active_passes.clear();
+            last_active_pass = nullptr;
+        } else if (type == "output_transform") {
+            if (!active_anchor.empty()) {
+                appendAfter(pass, active_anchor);
+            }
+            for (const auto &active_pass : active_passes) {
+                appendAfter(pass, active_pass);
+            }
+        } else {
+            if (!active_anchor.empty()) {
+                appendAfter(pass, active_anchor);
+            }
+            if (last_active_pass != nullptr) {
+                const auto previous_name = last_active_pass->at("name").get<std::string>();
+                if (!hasExplicitRelation(pass, previous_name) &&
+                    !hasExplicitRelation(*last_active_pass, name)) {
+                    appendAfter(pass, previous_name);
+                }
+            }
+            active_passes.push_back(name);
+            last_active_pass = &pass;
+        }
+    }
+}
+
+void canonicalizePasses(nlohmann::json &config, bool hdr_enabled) {
+    auto &rendering_passes = ensureArray(config, "rendering_passes");
+    for (auto &pass_set : rendering_passes) {
+        auto &passes = pass_set.at("passes");
+        if (!passes.is_array()) {
+            throw std::runtime_error("rendering pass requires passes array");
+        }
+        std::array<nlohmann::json, canonical_anchors.size()> buckets;
+        for (auto &bucket : buckets) {
+            bucket = nlohmann::json::array();
+        }
+        nlohmann::json scene_passes = nlohmann::json::array();
+        std::unordered_set<std::string> names;
+        for (auto &pass : passes) {
+            const auto name = requireStringField(pass, "name", "pass");
+            if (!names.insert(name).second || name == "output_transform" ||
+                name.rfind("__anchor_", 0) == 0) {
+                throw std::runtime_error("Pass name collides with canonical frame node: " + name);
+            }
+            const auto bucket = canonicalBucket(pass, hdr_enabled);
+            if (bucket == canonical_anchors.size()) {
+                scene_passes.push_back(pass);
+            } else {
+                buckets[bucket].push_back(pass);
+            }
+        }
+
+        nlohmann::json canonical = std::move(scene_passes);
+        for (size_t i = 0; i < canonical_anchors.size(); ++i) {
+            canonical.push_back(makeAnchor(canonical_anchors[i]));
+            for (auto &pass : buckets[i]) {
+                canonical.push_back(std::move(pass));
+            }
+        }
+        canonical.push_back(makeOutputTransform());
+        passes = std::move(canonical);
+    }
+}
+
+void retargetSwapchainAliases(nlohmann::json &config) {
+    for (auto &pass_set : ensureArray(config, "rendering_passes")) {
+        for (auto &pass : pass_set.at("passes")) {
+            if (pass.value("type", std::string{}) == "output_transform") {
+                continue;
+            }
+            if (pass.contains("output") && pass.at("output").is_object() &&
+                pass.at("output").contains("color")) {
+                replaceSwapchainAlias(pass.at("output").at("color"));
+            }
+        }
+    }
+}
+
+void enforceTerminalAfterComputeTasks(nlohmann::json &config) {
+    std::vector<std::string> compute_tasks;
+    if (config.contains("compute_tasks")) {
+        for (const auto &task : ensureArray(config, "compute_tasks")) {
+            compute_tasks.push_back(requireStringField(task, "name", "compute task"));
+        }
+    }
+    for (auto &pass_set : ensureArray(config, "rendering_passes")) {
+        for (auto &pass : pass_set.at("passes")) {
+            if (pass.value("type", std::string{}) != "output_transform") {
+                continue;
+            }
+            for (const auto &task : compute_tasks) {
+                appendAfter(pass, task);
+            }
+        }
+    }
+}
+
+void materializeSnapshots(nlohmann::json &config) {
+    if (!config.contains("snapshots")) {
+        return;
+    }
+    auto &snapshots = config.at("snapshots");
+    if (!snapshots.is_array()) {
+        throw std::runtime_error("rendering config snapshots must be an array");
+    }
+    if (snapshots.size() > 1) {
+        const auto second_name = snapshots.at(1).is_object()
+                                     ? snapshots.at(1).value("name", std::string{"<unnamed>"})
+                                     : std::string{"<invalid>"};
+        throw std::runtime_error("snapshot '" + second_name +
+                                 "' is unsupported: v1 permits exactly one opaque snapshot; "
+                                 "sequential refraction is not supported");
+    }
+    if (snapshots.empty()) {
+        return;
+    }
+
+    auto &snapshot = snapshots.front();
+    if (!snapshot.is_object()) {
+        throw std::runtime_error("rendering config snapshots entries must be objects");
+    }
+    const auto name = requireStringField(snapshot, "name", "snapshot");
+    const auto authored_after = requireStringField(snapshot, "after", "snapshot '" + name + "'");
+    if (!isIdentifier(name)) {
+        throw std::runtime_error("snapshot '" + name + "' must be a shader identifier");
+    }
+
+    auto target_names = collectRenderTargetNames(config);
+    if (target_names.contains(name)) {
+        throw std::runtime_error("snapshot '" + name + "' collides with render target name");
+    }
+
+    const auto anchor_it = std::find(canonical_anchors.begin(), canonical_anchors.end(), authored_after);
+    const auto after = anchor_it == canonical_anchors.end()
+                           ? authored_after
+                           : canonicalAnchorNodeName(authored_after);
+    const auto post_ldr = canonicalAnchorNodeName("post_ldr");
+    const auto transparent_begin = canonicalAnchorNodeName("pelican_ui");
+    const auto node = "__snapshot_" + name;
+
+    for (auto &pass_set : ensureArray(config, "rendering_passes")) {
+        auto &passes = pass_set.at("passes");
+        if (std::any_of(passes.begin(), passes.end(), [&](const auto &pass) {
+                return pass.value("name", std::string{}) == node;
+            })) {
+            throw std::runtime_error("snapshot '" + name + "' node collides with pass name: " + node);
+        }
+        auto found = std::find_if(passes.begin(), passes.end(), [&](const auto &pass) {
+            return pass.value("name", std::string{}) == after;
+        });
+        if (found == passes.end()) {
+            throw std::runtime_error("snapshot '" + name + "' copy point was not found: " +
+                                     authored_after);
+        }
+        const auto post_ldr_it = std::find_if(passes.begin(), passes.end(), [&](const auto &pass) {
+            return pass.value("name", std::string{}) == post_ldr;
+        });
+        const auto transparent_it = std::find_if(passes.begin(), passes.end(), [&](const auto &pass) {
+            return pass.value("name", std::string{}) == transparent_begin;
+        });
+        if (found < post_ldr_it || found >= transparent_it) {
+            throw std::runtime_error("snapshot '" + name + "' after '" + authored_after +
+                                     "' is not the opaque post_ldr region; transparent-after "
+                                     "snapshots and sequential refraction are unsupported in v1");
+        }
+
+        nlohmann::json copy{
+            {"name", node},
+            {"type", "snapshot_copy"},
+            {"source", "display"},
+            {"destination", name},
+            {"snapshot", name},
+            {"snapshot_after", authored_after},
+        };
+        passes.insert(found + 1, std::move(copy));
+    }
+
+    ensureArray(config, "render_targets").push_back({
+        {"name", name},
+        {"extent_scale", 1.0},
+        {"format", "B8G8R8A8_SRGB"},
+        {"format_class", "display"},
+        {"role", "color"},
+        {"usage", nlohmann::json::array({"TRANSFER_DST", "SAMPLED"})},
+    });
+}
+
+void initializeCanonicalColorPipeline(nlohmann::json &config, bool hdr_enabled) {
+    if (config.contains("resolver_version") &&
+        (!config.at("resolver_version").is_number_integer() ||
+         config.at("resolver_version").get<int>() != color_format_resolver_version)) {
+        throw std::runtime_error("Only rendering resolver_version 2 is supported");
+    }
+    config["resolver_version"] = color_format_resolver_version;
+    addFormatClassesAndDisplay(config);
+    if (hdr_enabled) {
+        prepareHdrSceneOutput(config);
+    }
+    canonicalizePasses(config, hdr_enabled);
+}
+
+std::unordered_set<std::string> collectRenderTargetNames(const nlohmann::json &config) {
+    std::unordered_set<std::string> names;
+    if (!config.contains("render_targets")) {
+        return names;
+    }
+    const auto &targets = config.at("render_targets");
+    if (!targets.is_array()) {
+        throw std::runtime_error("render_targets must be an array");
+    }
+    for (const auto &target : targets) {
+        if (!target.is_object()) {
+            throw std::runtime_error("render_targets entries must be objects");
+        }
+        const auto name = requireStringField(target, "name", "render target");
+        if (!names.insert(name).second) {
+            throw std::runtime_error("Duplicate render target name: " + name);
+        }
+    }
+    return names;
+}
+
+std::unordered_set<std::string> collectPassNames(const nlohmann::json &config) {
+    std::unordered_set<std::string> names;
+    if (!config.contains("rendering_passes")) {
+        return names;
+    }
+    const auto &rendering_passes = config.at("rendering_passes");
+    if (!rendering_passes.is_array()) {
+        throw std::runtime_error("rendering_passes must be an array");
+    }
+    for (const auto &pass_set : rendering_passes) {
+        const auto &passes = requireArrayField(pass_set, "passes", "rendering pass");
+        for (const auto &pass : passes) {
+            const auto name = requireStringField(pass, "name", "pass");
+            names.insert(name);
+        }
+    }
+    return names;
+}
+
+std::unordered_set<std::string> collectBufferNames(const nlohmann::json &config) {
+    std::unordered_set<std::string> names;
+    if (!config.contains("buffers")) {
+        return names;
+    }
+    const auto &buffers = config.at("buffers");
+    if (!buffers.is_array()) {
+        throw std::runtime_error("buffers must be an array");
+    }
+    for (const auto &buffer : buffers) {
+        std::string name;
+        if (buffer.is_string()) {
+            name = buffer.get<std::string>();
+        } else if (buffer.is_object()) {
+            name = requireStringField(buffer, "name", "buffer");
+        } else {
+            throw std::runtime_error("buffers entries must be strings or objects");
+        }
+        if (!names.insert(name).second) {
+            throw std::runtime_error("Duplicate buffer name: " + name);
+        }
+    }
+    return names;
+}
+
+std::unordered_set<std::string> collectComputeTaskNames(const nlohmann::json &config) {
+    std::unordered_set<std::string> names;
+    if (!config.contains("compute_tasks")) {
+        return names;
+    }
+    const auto &tasks = config.at("compute_tasks");
+    if (!tasks.is_array()) {
+        throw std::runtime_error("compute_tasks must be an array");
+    }
+    for (const auto &task : tasks) {
+        if (!task.is_object()) {
+            throw std::runtime_error("compute_tasks entries must be objects");
+        }
+        names.insert(requireStringField(task, "name", "compute task"));
+    }
+    return names;
+}
+
+nlohmann::json *findRenderTarget(nlohmann::json &config, const std::string &name) {
+    auto &targets = ensureArray(config, "render_targets");
+    for (auto &target : targets) {
+        if (target.is_object() && target.value("name", std::string{}) == name) {
+            return &target;
+        }
+    }
+    return nullptr;
+}
+
+struct RenderTargetParameterDeclaration {
+    std::string name;
+    bool required = true;
+    std::optional<std::string> default_target;
+    nlohmann::json constraints;
+};
+
+enum class ScalarParameterType {
+    floating,
+    integer,
+    boolean,
+};
+
+struct ScalarParameterDeclaration {
+    std::string name;
+    ScalarParameterType type = ScalarParameterType::floating;
+    nlohmann::json default_value;
+    std::optional<std::pair<nlohmann::json, nlohmann::json>> range;
+};
+
+struct FeatureParameterDeclarations {
+    std::vector<RenderTargetParameterDeclaration> render_targets;
+    std::vector<ScalarParameterDeclaration> scalars;
+};
+
+[[noreturn]] void throwBindingError(const std::string &feature_name,
+                                    const std::string &parameter_name,
+                                    const std::string &target_name,
+                                    const std::string &detail) {
+    throw std::runtime_error("render feature '" + feature_name + "' parameter '" +
+                             parameter_name + "' target '" + target_name + "': " + detail);
+}
+
+[[noreturn]] void throwParameterError(const std::string &feature_name,
+                                      const std::string &parameter_name,
+                                      const std::string &detail) {
+    throw std::runtime_error("render feature '" + feature_name + "' parameter '" +
+                             parameter_name + "': " + detail);
+}
+
+std::int64_t scalarIntegerValue(const nlohmann::json &value,
+                                const std::string &feature_name,
+                                const std::string &parameter_name,
+                                std::string_view field) {
+    std::int64_t result;
+    if (value.is_number_unsigned()) {
+        const auto unsigned_value = value.get<std::uint64_t>();
+        if (unsigned_value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            throwParameterError(feature_name, parameter_name,
+                                std::string{field} + " is outside the int range");
+        }
+        result = static_cast<std::int64_t>(unsigned_value);
+    } else if (value.is_number_integer()) {
+        result = value.get<std::int64_t>();
+    } else {
+        throwParameterError(feature_name, parameter_name,
+                            std::string{field} + " must have type int");
+    }
+    if (result < std::numeric_limits<std::int32_t>::min() ||
+        result > std::numeric_limits<std::int32_t>::max()) {
+        throwParameterError(feature_name, parameter_name,
+                            std::string{field} + " is outside the shader int range");
+    }
+    return result;
+}
+
+double scalarFloatValue(const nlohmann::json &value,
+                        const std::string &feature_name,
+                        const std::string &parameter_name,
+                        std::string_view field) {
+    if (!value.is_number()) {
+        throwParameterError(feature_name, parameter_name,
+                            std::string{field} + " must have type float");
+    }
+    const auto result = value.get<double>();
+    if (!std::isfinite(result) ||
+        std::abs(result) > static_cast<double>(std::numeric_limits<float>::max())) {
+        throwParameterError(feature_name, parameter_name,
+                            std::string{field} + " is outside the finite float range");
+    }
+    return result;
+}
+
+void validateScalarValue(const nlohmann::json &value,
+                         const ScalarParameterDeclaration &declaration,
+                         const std::string &feature_name,
+                         std::string_view field) {
+    switch (declaration.type) {
+    case ScalarParameterType::floating: {
+        const auto numeric = scalarFloatValue(value, feature_name, declaration.name, field);
+        if (declaration.range) {
+            const auto minimum = declaration.range->first.get<double>();
+            const auto maximum = declaration.range->second.get<double>();
+            if (numeric < minimum || numeric > maximum) {
+                throwParameterError(feature_name, declaration.name,
+                                    std::string{field} + " is outside declared range [" +
+                                        declaration.range->first.dump() + ", " +
+                                        declaration.range->second.dump() + "]");
+            }
+        }
+        return;
+    }
+    case ScalarParameterType::integer: {
+        const auto numeric = scalarIntegerValue(value, feature_name, declaration.name, field);
+        if (declaration.range) {
+            const auto minimum = scalarIntegerValue(declaration.range->first, feature_name,
+                                                    declaration.name, "range minimum");
+            const auto maximum = scalarIntegerValue(declaration.range->second, feature_name,
+                                                    declaration.name, "range maximum");
+            if (numeric < minimum || numeric > maximum) {
+                throwParameterError(feature_name, declaration.name,
+                                    std::string{field} + " is outside declared range [" +
+                                        declaration.range->first.dump() + ", " +
+                                        declaration.range->second.dump() + "]");
+            }
+        }
+        return;
+    }
+    case ScalarParameterType::boolean:
+        if (!value.is_boolean()) {
+            throwParameterError(feature_name, declaration.name,
+                                std::string{field} + " must have type bool");
+        }
+        return;
+    }
+}
+
+std::string upperIdentifier(std::string_view value, const std::string &feature_name) {
+    if (!isIdentifier(value)) {
+        throw std::runtime_error("render feature '" + feature_name +
+                                 "' name must be an identifier when scalar parameters are declared");
+    }
+    std::string result{value};
+    std::transform(result.begin(), result.end(), result.begin(), [](char ch) {
+        return static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    });
+    return result;
+}
+
+FeatureParameterDeclarations parseFeatureParameters(
+    const nlohmann::json &feature, const std::string &feature_name) {
+    if (!feature.contains("parameters")) {
+        return {};
+    }
+    const auto &parameters = feature.at("parameters");
+    if (!parameters.is_object()) {
+        throw std::runtime_error("render feature '" + feature_name +
+                                 "' parameters declaration must be an object");
+    }
+    for (auto field = parameters.begin(); field != parameters.end(); ++field) {
+        if (field.key() != "schema" && field.key() != "version" &&
+            field.key() != "render_targets" && field.key() != "scalars") {
+            throw std::runtime_error("render feature '" + feature_name +
+                                     "' parameters declaration has unknown field: " + field.key());
+        }
+    }
+    if (parameters.value("schema", std::string{}) != feature_parameters_schema) {
+        throw std::runtime_error("render feature '" + feature_name +
+                                 "' parameter schema is not supported");
+    }
+    if (!parameters.contains("version") || !parameters.at("version").is_number_integer() ||
+        parameters.at("version").get<int>() != supported_feature_parameters_version) {
+        throw std::runtime_error("render feature '" + feature_name +
+                                 "' parameter version is not supported");
+    }
+    FeatureParameterDeclarations declarations;
+    std::unordered_set<std::string> names;
+    const auto targets = parameters.contains("render_targets")
+                             ? parameters.at("render_targets")
+                             : nlohmann::json::array();
+    if (!targets.is_array()) {
+        throw std::runtime_error("render feature parameters: " + feature_name +
+                                 " requires array field: render_targets");
+    }
+    declarations.render_targets.reserve(targets.size());
+    for (const auto &target : targets) {
+        if (!target.is_object()) {
+            throw std::runtime_error("render feature '" + feature_name +
+                                     "' render-target parameters must be objects");
+        }
+        for (auto field = target.begin(); field != target.end(); ++field) {
+            if (field.key() != "name" && field.key() != "required" &&
+                field.key() != "default" && field.key() != "role" &&
+                field.key() != "format_class" && field.key() != "extent_scale" &&
+                field.key() != "width" && field.key() != "height" &&
+                field.key() != "sample_count" && field.key() != "usage") {
+                throw std::runtime_error("render feature '" + feature_name +
+                                         "' render-target parameter has unknown field: " +
+                                         field.key());
+            }
+        }
+        const auto name = requireStringField(target, "name", "render-target parameter");
+        if (!isIdentifier(name) || !names.insert(name).second) {
+            throw std::runtime_error("render feature '" + feature_name +
+                                     "' has invalid or duplicate render-target parameter: " + name);
+        }
+        if (target.contains("required") && !target.at("required").is_boolean()) {
+            throwBindingError(feature_name, name, "<declaration>", "required must be boolean");
+        }
+        std::optional<std::string> default_target;
+        if (target.contains("default")) {
+            if (!target.at("default").is_string()) {
+                throwBindingError(feature_name, name, "<declaration>",
+                                  "default must name a render target");
+            }
+            default_target = target.at("default").get<std::string>();
+        }
+        declarations.render_targets.push_back(RenderTargetParameterDeclaration{
+            name, target.value("required", true), std::move(default_target), target});
+    }
+
+    const auto scalars = parameters.contains("scalars")
+                             ? parameters.at("scalars")
+                             : nlohmann::json::array();
+    if (!scalars.is_array()) {
+        throw std::runtime_error("render feature parameters: " + feature_name +
+                                 " requires array field: scalars");
+    }
+    declarations.scalars.reserve(scalars.size());
+    std::unordered_set<std::string> define_components;
+    for (const auto &scalar : scalars) {
+        if (!scalar.is_object()) {
+            throw std::runtime_error("render feature '" + feature_name +
+                                     "' scalar parameters must be objects");
+        }
+        for (auto field = scalar.begin(); field != scalar.end(); ++field) {
+            if (field.key() != "name" && field.key() != "type" &&
+                field.key() != "range" && field.key() != "default") {
+                throw std::runtime_error("render feature '" + feature_name +
+                                         "' scalar parameter has unknown field: " + field.key());
+            }
+        }
+        const auto name = requireStringField(scalar, "name", "scalar parameter");
+        if (!isIdentifier(name) || !names.insert(name).second) {
+            throw std::runtime_error("render feature '" + feature_name +
+                                     "' has invalid or duplicate parameter: " + name);
+        }
+        if (!define_components.insert(upperIdentifier(name, feature_name)).second) {
+            throwParameterError(feature_name, name,
+                                "name collides after shader define uppercasing");
+        }
+        const auto type_name = requireStringField(scalar, "type", "scalar parameter: " + name);
+        ScalarParameterType type;
+        if (type_name == "float") {
+            type = ScalarParameterType::floating;
+        } else if (type_name == "int") {
+            type = ScalarParameterType::integer;
+        } else if (type_name == "bool") {
+            type = ScalarParameterType::boolean;
+        } else {
+            throwParameterError(feature_name, name, "unknown scalar type: " + type_name);
+        }
+        if (!scalar.contains("default")) {
+            throwParameterError(feature_name, name, "declaration requires default");
+        }
+
+        std::optional<std::pair<nlohmann::json, nlohmann::json>> range;
+        if (type == ScalarParameterType::boolean) {
+            if (scalar.contains("range")) {
+                throwParameterError(feature_name, name, "bool declaration must not have range");
+            }
+        } else {
+            if (!scalar.contains("range") || !scalar.at("range").is_array() ||
+                scalar.at("range").size() != 2) {
+                throwParameterError(feature_name, name,
+                                    "numeric declaration requires two-element range");
+            }
+            const auto &minimum = scalar.at("range").at(0);
+            const auto &maximum = scalar.at("range").at(1);
+            if (type == ScalarParameterType::floating) {
+                const auto min_value = scalarFloatValue(minimum, feature_name, name,
+                                                        "range minimum");
+                const auto max_value = scalarFloatValue(maximum, feature_name, name,
+                                                        "range maximum");
+                if (min_value > max_value) {
+                    throwParameterError(feature_name, name, "range minimum exceeds maximum");
+                }
+                range = std::pair{nlohmann::json(min_value), nlohmann::json(max_value)};
+            } else {
+                const auto min_value = scalarIntegerValue(minimum, feature_name, name,
+                                                          "range minimum");
+                const auto max_value = scalarIntegerValue(maximum, feature_name, name,
+                                                          "range maximum");
+                if (min_value > max_value) {
+                    throwParameterError(feature_name, name, "range minimum exceeds maximum");
+                }
+                range = std::pair{nlohmann::json(min_value), nlohmann::json(max_value)};
+            }
+        }
+
+        ScalarParameterDeclaration declaration{name, type, scalar.at("default"), std::move(range)};
+        validateScalarValue(declaration.default_value, declaration, feature_name, "default");
+        declarations.scalars.push_back(std::move(declaration));
+    }
+    return declarations;
+}
+
+std::string scalarDefineValue(const nlohmann::json &value,
+                              const ScalarParameterDeclaration &declaration,
+                              const std::string &feature_name) {
+    switch (declaration.type) {
+    case ScalarParameterType::floating: {
+        const auto numeric = static_cast<float>(
+            scalarFloatValue(value, feature_name, declaration.name, "value"));
+        std::array<char, 32> buffer{};
+        const auto [end, error] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), numeric,
+                                                std::chars_format::general,
+                                                std::numeric_limits<float>::max_digits10);
+        if (error != std::errc{}) {
+            throwParameterError(feature_name, declaration.name,
+                                "could not format float define value");
+        }
+        return std::string{buffer.data(), end};
+    }
+    case ScalarParameterType::integer:
+        return std::to_string(scalarIntegerValue(value, feature_name, declaration.name, "value"));
+    case ScalarParameterType::boolean:
+        return value.get<bool>() ? "1" : "0";
+    }
+    throwParameterError(feature_name, declaration.name, "unknown scalar type");
+}
+
+void validateTargetBinding(const nlohmann::json &config,
+                           const RenderTargetParameterDeclaration &declaration,
+                           const std::string &target_name,
+                           const std::string &feature_name) {
+    const nlohmann::json *target = nullptr;
+    for (const auto &candidate : config.at("render_targets")) {
+        if (candidate.value("name", std::string{}) == target_name) {
+            target = &candidate;
+            break;
+        }
+    }
+    if (target == nullptr) {
+        throwBindingError(feature_name, declaration.name, target_name, "unknown render target");
+    }
+
+    const auto &constraints = declaration.constraints;
+    const auto requireEqual = [&](std::string_view field, const nlohmann::json &actual) {
+        if (constraints.contains(field) && constraints.at(field) != actual) {
+            throwBindingError(feature_name, declaration.name, target_name,
+                              std::string{field} + " is incompatible (expected " +
+                                  constraints.at(field).dump() + ", got " + actual.dump() + ")");
+        }
+    };
+    requireEqual("role", target->value("role", std::string{}));
+    requireEqual("format_class", target->value("format_class", std::string{}));
+    requireEqual("extent_scale", target->value("extent_scale", 1.0));
+    requireEqual("width", target->value("width", 0));
+    requireEqual("height", target->value("height", 0));
+    requireEqual("sample_count", target->value("sample_count", 1));
+
+    if (constraints.contains("usage")) {
+        const auto required_usage = parseStringArray(constraints, "usage",
+                                                     "render-target parameter: " + declaration.name);
+        const auto actual_usage = parseStringArray(*target, "usage", "render target: " + target_name);
+        for (const auto &usage : required_usage) {
+            if (std::find(actual_usage.begin(), actual_usage.end(), usage) == actual_usage.end()) {
+                throwBindingError(feature_name, declaration.name, target_name,
+                                  "usage is incompatible; missing " + usage);
+            }
+        }
+    }
+}
+
+std::string replaceBoundTargetReference(
+    const std::string &authored,
+    const std::unordered_map<std::string, std::string> &bindings,
+    const std::string &feature_name) {
+    if (authored.empty() || authored.front() != '$') {
+        return authored;
+    }
+    constexpr std::string_view history_suffix = "@history";
+    const bool history = authored.size() > history_suffix.size() &&
+                         authored.ends_with(history_suffix);
+    const auto end = history ? authored.size() - history_suffix.size() : authored.size();
+    const auto parameter = authored.substr(1, end - 1);
+    const auto found = bindings.find(parameter);
+    if (found == bindings.end()) {
+        throwBindingError(feature_name, parameter, "<unresolved>",
+                          "placeholder has no resolved binding");
+    }
+    return found->second + (history ? std::string{history_suffix} : std::string{});
+}
+
+void replaceBoundTargetValue(nlohmann::json &value,
+                             const std::unordered_map<std::string, std::string> &bindings,
+                             const std::string &feature_name) {
+    if (value.is_string()) {
+        value = replaceBoundTargetReference(value.get<std::string>(), bindings, feature_name);
+    } else if (value.is_array()) {
+        for (auto &entry : value) {
+            replaceBoundTargetValue(entry, bindings, feature_name);
+        }
+    }
+}
+
+nlohmann::json bindFeatureParameters(const nlohmann::json &authored_feature,
+                                     const nlohmann::json &instance_parameters,
+                                     const nlohmann::json &config,
+                                     const std::string &feature_name,
+                                     nlohmann::json &resolved_parameters,
+                                     std::vector<std::string> &scalar_defines) {
+    const auto declarations = parseFeatureParameters(authored_feature, feature_name);
+    std::unordered_map<std::string, const RenderTargetParameterDeclaration *> by_name;
+    for (const auto &declaration : declarations.render_targets) {
+        by_name.emplace(declaration.name, &declaration);
+    }
+    std::unordered_map<std::string, const ScalarParameterDeclaration *> scalars_by_name;
+    for (const auto &declaration : declarations.scalars) {
+        scalars_by_name.emplace(declaration.name, &declaration);
+    }
+    for (auto parameter = instance_parameters.begin(); parameter != instance_parameters.end(); ++parameter) {
+        if (!by_name.contains(parameter.key()) && !scalars_by_name.contains(parameter.key())) {
+            if (parameter.value().is_string()) {
+                throwBindingError(feature_name, parameter.key(),
+                                  parameter.value().get<std::string>(), "unknown parameter");
+            }
+            throwParameterError(feature_name, parameter.key(), "unknown parameter");
+        }
+        if (by_name.contains(parameter.key()) && !parameter.value().is_string()) {
+            throwBindingError(feature_name, parameter.key(), "<non-string>",
+                               "binding must name a render target");
+        }
+    }
+
+    std::unordered_map<std::string, std::string> bindings;
+    resolved_parameters = nlohmann::json::object();
+    for (const auto &declaration : declarations.render_targets) {
+        std::optional<std::string> target_name;
+        if (const auto bound = instance_parameters.find(declaration.name);
+            bound != instance_parameters.end()) {
+            target_name = bound->get<std::string>();
+        } else {
+            target_name = declaration.default_target;
+        }
+        if (!target_name) {
+            if (declaration.required) {
+                throwBindingError(feature_name, declaration.name, "<missing>",
+                                  "required parameter is missing");
+            }
+            continue;
+        }
+        validateTargetBinding(config, declaration, *target_name, feature_name);
+        bindings.emplace(declaration.name, *target_name);
+        resolved_parameters[declaration.name] = *target_name;
+    }
+
+    const auto feature_define_prefix = declarations.scalars.empty()
+                                           ? std::string{}
+                                           : "PELICAN_FEATURE_" +
+                                                 upperIdentifier(feature_name, feature_name) + "_";
+    for (const auto &declaration : declarations.scalars) {
+        const auto supplied = instance_parameters.find(declaration.name);
+        const auto &value = supplied != instance_parameters.end()
+                                ? supplied.value()
+                                : declaration.default_value;
+        validateScalarValue(value, declaration, feature_name,
+                            supplied != instance_parameters.end() ? "value" : "default");
+        resolved_parameters[declaration.name] = value;
+        scalar_defines.push_back(feature_define_prefix +
+                                 upperIdentifier(declaration.name, feature_name) + "=" +
+                                 scalarDefineValue(value, declaration, feature_name));
+    }
+
+    auto feature = authored_feature;
+    feature.erase("parameters");
+    if (feature.contains("passes")) {
+        for (auto &entry : feature.at("passes")) {
+            auto &pass = entry.at("pass");
+            if (pass.contains("input")) {
+                replaceBoundTargetValue(pass.at("input"), bindings, feature_name);
+            }
+            if (pass.contains("output") && pass.at("output").is_object()) {
+                auto &output = pass.at("output");
+                if (output.contains("color")) {
+                    replaceBoundTargetValue(output.at("color"), bindings, feature_name);
+                }
+                if (output.contains("depth")) {
+                    replaceBoundTargetValue(output.at("depth"), bindings, feature_name);
+                }
+            }
+        }
+    }
+    if (feature.contains("pass_overrides")) {
+        for (auto &override_json : feature.at("pass_overrides")) {
+            if (override_json.contains("input")) {
+                replaceBoundTargetValue(override_json.at("input"), bindings, feature_name);
+            }
+        }
+    }
+    if (feature.contains("render_target_overrides")) {
+        nlohmann::json replaced = nlohmann::json::object();
+        for (auto override_it = feature.at("render_target_overrides").begin();
+             override_it != feature.at("render_target_overrides").end(); ++override_it) {
+            const auto target_name =
+                replaceBoundTargetReference(override_it.key(), bindings, feature_name);
+            if (replaced.contains(target_name)) {
+                throwBindingError(feature_name, override_it.key(), target_name,
+                                  "render_target_overrides binding collides");
+            }
+            replaced[target_name] = override_it.value();
+        }
+        feature["render_target_overrides"] = std::move(replaced);
+    }
+    return feature;
+}
+
+void addRenderTargets(nlohmann::json &config, const nlohmann::json &feature,
+                      std::unordered_set<std::string> &target_names) {
+    if (!feature.contains("render_targets")) {
+        return;
+    }
+
+    const auto &feature_targets = requireArrayField(feature, "render_targets", "render feature");
+    auto &targets = ensureArray(config, "render_targets");
+    for (const auto &target : feature_targets) {
+        if (!target.is_object()) {
+            throw std::runtime_error("render feature render_targets entries must be objects");
+        }
+        const auto name = requireStringField(target, "name", "render feature render target");
+        if (!target_names.insert(name).second) {
+            throw std::runtime_error("Render feature render target name collides: " + name);
+        }
+        targets.push_back(target);
+    }
+}
+
+void addBuffers(nlohmann::json &config, const nlohmann::json &feature,
+                std::unordered_set<std::string> &buffer_names) {
+    if (!feature.contains("buffers")) {
+        return;
+    }
+
+    const auto &feature_buffers = requireArrayField(feature, "buffers", "render feature");
+    auto &buffers = ensureArray(config, "buffers");
+    for (const auto &buffer : feature_buffers) {
+        std::string name;
+        if (buffer.is_string()) {
+            name = buffer.get<std::string>();
+        } else if (buffer.is_object()) {
+            name = requireStringField(buffer, "name", "render feature buffer");
+        } else {
+            throw std::runtime_error("render feature buffers entries must be strings or objects");
+        }
+        if (!buffer_names.insert(name).second) {
+            throw std::runtime_error("Render feature buffer name collides: " + name);
+        }
+        buffers.push_back(buffer);
+    }
+}
+
+void mergeUsage(nlohmann::json &target, const nlohmann::json &override_json, const std::string &name) {
+    const auto override_usage = parseStringArray(override_json, "usage", "render target override: " + name);
+    if (!target.contains("usage") || !target.at("usage").is_array()) {
+        throw std::runtime_error("render target override requires existing usage array: " + name);
+    }
+
+    std::vector<std::string> usage;
+    for (const auto &entry : target.at("usage")) {
+        if (!entry.is_string()) {
+            throw std::runtime_error("render target usage must be a string array: " + name);
+        }
+        appendUnique(usage, entry.get<std::string>());
+    }
+    appendUnique(usage, override_usage);
+    target["usage"] = usage;
+}
+
+void applyRenderTargetOverrides(nlohmann::json &config, const nlohmann::json &feature) {
+    if (!feature.contains("render_target_overrides")) {
+        return;
+    }
+    const auto &overrides = feature.at("render_target_overrides");
+    if (!overrides.is_object()) {
+        throw std::runtime_error("render feature render_target_overrides must be an object");
+    }
+
+    for (auto it = overrides.begin(); it != overrides.end(); ++it) {
+        const auto name = it.key();
+        const auto &override_json = it.value();
+        if (!override_json.is_object()) {
+            throw std::runtime_error("render target override must be an object: " + name);
+        }
+
+        auto *target = findRenderTarget(config, name);
+        if (target == nullptr) {
+            throw std::runtime_error("render target override references unknown render target: " + name);
+        }
+
+        for (auto field = override_json.begin(); field != override_json.end(); ++field) {
+            if (field.key() != "format" && field.key() != "usage" &&
+                field.key() != "width" && field.key() != "height") {
+                throw std::runtime_error(
+                    "render target override only supports format, usage, width, and height: " + name);
+            }
+        }
+        if (override_json.contains("format")) {
+            if (!override_json.at("format").is_string()) {
+                throw std::runtime_error("render target override format must be a string: " + name);
+            }
+            (*target)["format"] = override_json.at("format");
+        }
+        if (override_json.contains("usage")) {
+            mergeUsage(*target, override_json, name);
+        }
+        if (override_json.contains("width")) {
+            if (!override_json.at("width").is_number_integer()) {
+                throw std::runtime_error("render target override width must be an integer: " + name);
+            }
+            (*target)["width"] = override_json.at("width");
+        }
+        if (override_json.contains("height")) {
+            if (!override_json.at("height").is_number_integer()) {
+                throw std::runtime_error("render target override height must be an integer: " + name);
+            }
+            (*target)["height"] = override_json.at("height");
+        }
+    }
+}
+
+struct AnchorMatch {
+    nlohmann::json *passes = nullptr;
+    size_t index = 0;
+};
+
+std::vector<AnchorMatch> findAnchorMatches(nlohmann::json &config, const std::string &anchor_name) {
+    std::vector<AnchorMatch> matches;
+    auto &rendering_passes = ensureArray(config, "rendering_passes");
+    for (auto &pass_set : rendering_passes) {
+        auto &passes = pass_set.at("passes");
+        for (size_t i = 0; i < passes.size(); ++i) {
+            if (passes.at(i).is_object() &&
+                passes.at(i).value("type", std::string{}) == "canonical_anchor" &&
+                passes.at(i).value("anchor", std::string{}) == anchor_name) {
+                matches.push_back(AnchorMatch{&passes, i});
+            }
+        }
+    }
+    if (!matches.empty()) {
+        return matches;
+    }
+    // Non-canonical names remain valid only for migration/negative fixtures.
+    for (auto &pass_set : rendering_passes) {
+        auto &passes = pass_set.at("passes");
+        for (size_t i = 0; i < passes.size(); ++i) {
+            if (passes.at(i).is_object() && passes.at(i).value("name", std::string{}) == anchor_name) {
+                matches.push_back(AnchorMatch{&passes, i});
+            }
+        }
+    }
+    return matches;
+}
+
+void insertPassAtEnd(nlohmann::json &config, const nlohmann::json &pass) {
+    auto &rendering_passes = ensureArray(config, "rendering_passes");
+    if (rendering_passes.size() != 1) {
+        throw std::runtime_error("render feature insert:end requires exactly one rendering pass");
+    }
+    auto &passes = rendering_passes.at(0).at("passes");
+    passes.push_back(pass);
+}
+
+void appendStringListValue(nlohmann::json &json, const std::string &field_name,
+                           const std::string &value) {
+    if (!json.contains(field_name)) {
+        json[field_name] = nlohmann::json::array();
+    } else if (json.at(field_name).is_string()) {
+        json[field_name] = nlohmann::json::array({json.at(field_name).get<std::string>()});
+    }
+    if (!json.at(field_name).is_array()) {
+        throw std::runtime_error("render feature pass explicit edge must be a string or array: " + field_name);
+    }
+
+    auto &values = json.at(field_name);
+    const auto exists = std::find(values.begin(), values.end(), value);
+    if (exists == values.end()) {
+        values.push_back(value);
+    }
+}
+
+void insertPassByAnchor(nlohmann::json &config, const std::string &insert, const nlohmann::json &pass) {
+    constexpr std::string_view before_prefix = "before:";
+    constexpr std::string_view after_prefix = "after:";
+
+    bool after = false;
+    std::string anchor;
+    if (insert.rfind(before_prefix, 0) == 0) {
+        anchor = insert.substr(before_prefix.size());
+    } else if (insert.rfind(after_prefix, 0) == 0) {
+        after = true;
+        anchor = insert.substr(after_prefix.size());
+    } else {
+        throw std::runtime_error("render feature pass insert must be before:<pass>, after:<pass>, or end");
+    }
+    if (anchor.empty()) {
+        throw std::runtime_error("render feature pass insert anchor must not be empty");
+    }
+
+    auto matches = findAnchorMatches(config, anchor);
+    if (matches.empty()) {
+        throw std::runtime_error("render feature pass insert anchor was not found: " + anchor);
+    }
+    if (matches.size() > 1) {
+        throw std::runtime_error("render feature pass insert anchor is ambiguous: " + anchor);
+    }
+
+    auto &passes = *matches.front().passes;
+    auto index = matches.front().index + (after ? 1 : 0);
+    const bool canonical_anchor = passes.at(matches.front().index).value("type", std::string{}) ==
+                                  "canonical_anchor";
+    if (after && canonical_anchor) {
+        while (index < passes.size() &&
+               passes.at(index).value("type", std::string{}) != "canonical_anchor" &&
+               passes.at(index).value("type", std::string{}) != "output_transform") {
+            ++index;
+        }
+    }
+    auto anchored_pass = pass;
+    const auto dependency_name =
+        passes.at(matches.front().index).value("name", std::string{});
+    appendStringListValue(anchored_pass, after ? "after" : "before", dependency_name);
+    passes.insert(passes.begin() + static_cast<nlohmann::json::difference_type>(index), anchored_pass);
+}
+
+void addFeaturePasses(nlohmann::json &config, const nlohmann::json &feature,
+                      std::unordered_set<std::string> &pass_names) {
+    if (!feature.contains("passes")) {
+        return;
+    }
+    const auto &passes = requireArrayField(feature, "passes", "render feature");
+    for (const auto &entry : passes) {
+        if (!entry.is_object()) {
+            throw std::runtime_error("render feature passes entries must be objects");
+        }
+        const auto insert = requireStringField(entry, "insert", "render feature pass entry");
+        const auto pass_it = entry.find("pass");
+        if (pass_it == entry.end() || !pass_it->is_object()) {
+            throw std::runtime_error("render feature pass entry requires pass object");
+        }
+        const auto pass_name = requireStringField(*pass_it, "name", "render feature pass");
+        if (!pass_names.insert(pass_name).second) {
+            throw std::runtime_error("Render feature pass name collides: " + pass_name);
+        }
+
+        if (insert == "end") {
+            insertPassAtEnd(config, *pass_it);
+        } else {
+            insertPassByAnchor(config, insert, *pass_it);
+        }
+    }
+}
+
+nlohmann::json *findPass(nlohmann::json &config, const std::string &pass_name) {
+    auto &rendering_passes = ensureArray(config, "rendering_passes");
+    nlohmann::json *found_pass = nullptr;
+    for (auto &pass_set : rendering_passes) {
+        auto &passes = pass_set.at("passes");
+        for (auto &pass : passes) {
+            if (!pass.is_object() || pass.value("name", std::string{}) != pass_name) {
+                continue;
+            }
+            if (found_pass != nullptr) {
+                throw std::runtime_error("render feature pass override is ambiguous: " + pass_name);
+            }
+            found_pass = &pass;
+        }
+    }
+    return found_pass;
+}
+
+void applyPassOverrides(nlohmann::json &config, const nlohmann::json &feature) {
+    if (!feature.contains("pass_overrides")) {
+        return;
+    }
+    const auto &overrides = feature.at("pass_overrides");
+    if (!overrides.is_object()) {
+        throw std::runtime_error("render feature pass_overrides must be an object");
+    }
+
+    for (auto it = overrides.begin(); it != overrides.end(); ++it) {
+        const auto pass_name = it.key();
+        const auto &override_json = it.value();
+        if (!override_json.is_object()) {
+            throw std::runtime_error("render feature pass override must be an object: " + pass_name);
+        }
+        auto *pass = findPass(config, pass_name);
+        if (pass == nullptr) {
+            throw std::runtime_error("render feature pass override references unknown pass: " + pass_name);
+        }
+
+        for (auto field = override_json.begin(); field != override_json.end(); ++field) {
+            if (field.key() != "input") {
+                throw std::runtime_error("render feature pass override only supports input: " + pass_name);
+            }
+        }
+        if (override_json.contains("input")) {
+            for (const auto &input : parseStringArray(override_json, "input",
+                                                      "render feature pass override: " + pass_name)) {
+                appendStringListValue(*pass, "input", input);
+            }
+        }
+    }
+}
+
+void addFeatureComputeTasks(nlohmann::json &config, const nlohmann::json &feature,
+                            std::unordered_set<std::string> &task_names) {
+    if (!feature.contains("compute_tasks")) {
+        return;
+    }
+    const auto &tasks = requireArrayField(feature, "compute_tasks", "render feature");
+    auto &compute_tasks = ensureArray(config, "compute_tasks");
+    for (const auto &task : tasks) {
+        if (!task.is_object()) {
+            throw std::runtime_error("render feature compute_tasks entries must be objects");
+        }
+        const auto task_name = requireStringField(task, "name", "render feature compute task");
+        if (!task_names.insert(task_name).second) {
+            throw std::runtime_error("Render feature compute task name collides: " + task_name);
+        }
+        compute_tasks.push_back(task);
+    }
+}
+
+void appendShaderDefines(std::vector<std::string> &defines, const nlohmann::json &json,
+                         std::string_view context) {
+    if (!json.contains("shader_defines")) {
+        return;
+    }
+    appendUnique(defines, parseStringArray(json, "shader_defines", context));
+}
+
+} // namespace
+
+RenderFeatureComposeResult composeRenderFeatureConfig(
+    const nlohmann::json &config,
+    const RenderFeatureComposeDependencies &dependencies) {
+    if (!config.is_object()) {
+        throw std::runtime_error("Rendering config must be an object");
+    }
+
+    const auto feature_instances = parseFeatureInstances(config);
+    std::vector<std::string> shader_defines;
+    appendShaderDefines(shader_defines, config, "rendering config");
+    if (!feature_instances.empty() && !dependencies.runtime_shader_compiler_enabled) {
+        throw std::runtime_error(std::string{runtime_compiler_required_message});
+    }
+
+    struct LoadedFeature {
+        FeatureInstance instance;
+        std::string name;
+        nlohmann::json feature;
+    };
+    std::vector<LoadedFeature> loaded_features;
+    std::vector<std::string> feature_names;
+    std::vector<std::string> excluded_feature_names;
+    std::optional<nlohmann::json> projection_jitter;
+    bool hdr_enabled = false;
+    loaded_features.reserve(feature_instances.size());
+    for (const auto &instance : feature_instances) {
+        auto feature = loadFeatureJson(instance.ref, dependencies);
+        const auto feature_name = validateFeatureEnvelope(feature, instance.ref);
+        if (dependencies.include_feature &&
+            !dependencies.include_feature(feature_name, feature)) {
+            appendUnique(excluded_feature_names, feature_name);
+            continue;
+        }
+        appendUnique(feature_names, feature_name);
+        hdr_enabled = hdr_enabled || feature_name == "hdr";
+        if (auto declaration = parseProjectionJitterDeclaration(feature, feature_name)) {
+            if (projection_jitter) {
+                throw std::runtime_error(
+                    "projection_jitter providers '" + projection_jitter->at("provider").get<std::string>() +
+                    "' and '" + feature_name + "' cannot both be enabled");
+            }
+            projection_jitter = std::move(declaration);
+        }
+        loaded_features.push_back(LoadedFeature{instance, feature_name, std::move(feature)});
+    }
+
+    auto composed = config;
+    composed.erase("features");
+    initializeCanonicalColorPipeline(composed, hdr_enabled);
+
+    auto target_names = collectRenderTargetNames(composed);
+    auto pass_names = collectPassNames(composed);
+    auto buffer_names = collectBufferNames(composed);
+    auto task_names = collectComputeTaskNames(composed);
+    nlohmann::json resolved_instances = nlohmann::json::array();
+    for (const auto &loaded : loaded_features) {
+        nlohmann::json resolved_parameters;
+        std::vector<std::string> scalar_defines;
+        const auto feature = bindFeatureParameters(loaded.feature, loaded.instance.parameters,
+                                                   composed, loaded.name, resolved_parameters,
+                                                   scalar_defines);
+        addRenderTargets(composed, feature, target_names);
+        addBuffers(composed, feature, buffer_names);
+        applyRenderTargetOverrides(composed, feature);
+        addFeaturePasses(composed, feature, pass_names);
+        applyPassOverrides(composed, feature);
+        addFeatureComputeTasks(composed, feature, task_names);
+        appendShaderDefines(shader_defines, feature, "render feature");
+        appendUnique(shader_defines, scalar_defines);
+        resolved_instances.push_back({
+            {"feature", loaded.name},
+            {"parameters", std::move(resolved_parameters)},
+            {"ref", loaded.instance.ref},
+        });
+    }
+
+    if (!shader_defines.empty()) {
+        composed["shader_defines"] = shader_defines;
+    }
+    for (auto &target : ensureArray(composed, "render_targets")) {
+        if (!target.contains("format_class")) {
+            target["format_class"] = inferFormatClass(target);
+        }
+        if (!target.contains("role")) {
+            const auto format_class = target.at("format_class").get<std::string>();
+            target["role"] = (format_class == "scene" || format_class == "display") ? "color" : "data";
+        }
+    }
+    retargetSwapchainAliases(composed);
+    materializeSnapshots(composed);
+    for (auto &pass_set : ensureArray(composed, "rendering_passes")) {
+        enforceCanonicalOrder(pass_set.at("passes"));
+    }
+    enforceTerminalAfterComputeTasks(composed);
+    RenderFeatureComposeResult result;
+    result.config = std::move(composed);
+    result.shader_defines = std::move(shader_defines);
+    result.feature_names = std::move(feature_names);
+    result.excluded_feature_names = std::move(excluded_feature_names);
+    result.projection_jitter = std::move(projection_jitter);
+    result.feature_instances = std::move(resolved_instances);
+    result.used_features = !feature_instances.empty();
+    return result;
+}
+
+} // namespace Pelican

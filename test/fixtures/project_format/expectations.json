@@ -1,0 +1,135 @@
+[
+  {
+    "file": "valid/project_relative.json",
+    "expect": "ok"
+  },
+  {
+    "file": "valid/project_scheme.json",
+    "expect": "ok"
+  },
+  {
+    "file": "valid/engine_default_config.json",
+    "expect": "ok"
+  },
+  {
+    "file": "invalid/escape_parent.json",
+    "expect": "error",
+    "error_kind": "escape"
+  },
+  {
+    "file": "invalid/absolute_project_ref.json",
+    "expect": "error",
+    "error_kind": "absolute"
+  },
+  {
+    "file": "invalid/unknown_engine.json",
+    "expect": "error",
+    "error_kind": "unknown_engine_id"
+  },
+  {
+    "file": "invalid/backslash_separator.json",
+    "expect": "error",
+    "error_kind": "separator"
+  },
+  {
+    "file": "invalid/empty_ref.json",
+    "expect": "error",
+    "error_kind": "empty"
+  },
+  {
+    "file": "valid/project_basic_config.json",
+    "expect": "ok"
+  },
+  {
+    "file": "invalid/project_newer_engine.json",
+    "expect": "error",
+    "error_kind": "engine_version"
+  },
+  {
+    "file": "invalid/project_bad_schema.json",
+    "expect": "error",
+    "error_kind": "schema"
+  },
+  {
+    "file": "invalid/project_future_version.json",
+    "expect": "error",
+    "error_kind": "version"
+  },
+  {
+    "file": "invalid/project_version_zero.json",
+    "expect": "error",
+    "error_kind": "version"
+  },
+  {
+    "file": "invalid/project_version_negative.json",
+    "expect": "error",
+    "error_kind": "version"
+  },
+  {
+    "file": "valid/shader_stem_spv.json",
+    "expect": "ok"
+  },
+  {
+    "file": "valid/shader_stem_engine.json",
+    "expect": "ok"
+  },
+  {
+    "file": "invalid/shader_stem_missing.json",
+    "expect": "error",
+    "error_kind": "shader_stem_missing"
+  },
+  {
+    "file": "valid/scene_v1.json",
+    "expect": "ok"
+  },
+  {
+    "file": "invalid/scene_missing_schema.json",
+    "expect": "error",
+    "error_kind": "schema"
+  },
+  {
+    "file": "invalid/scene_bad_schema.json",
+    "expect": "error",
+    "error_kind": "schema"
+  },
+  {
+    "file": "invalid/scene_future_version.json",
+    "expect": "error",
+    "error_kind": "version"
+  },
+  {
+    "file": "invalid/scene_version_zero.json",
+    "expect": "error",
+    "error_kind": "version"
+  },
+  {
+    "file": "invalid/scene_version_negative.json",
+    "expect": "error",
+    "error_kind": "version"
+  },
+  {
+    "file": "invalid/scene_legacy_lights.json",
+    "expect": "error",
+    "error_kind": "legacy_lights"
+  },
+  {
+    "file": "invalid/scene_duplicate_name.json",
+    "expect": "error",
+    "error_kind": "duplicate_name"
+  },
+  {
+    "file": "invalid/scene_unknown_parent.json",
+    "expect": "error",
+    "error_kind": "unknown_parent"
+  },
+  {
+    "file": "invalid/scene_ambiguous_parent.json",
+    "expect": "error",
+    "error_kind": "ambiguous_parent"
+  },
+  {
+    "file": "invalid/scene_parent_cycle.json",
+    "expect": "error",
+    "error_kind": "parent_cycle"
+  }
+]

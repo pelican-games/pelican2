@@ -1,5 +1,6 @@
 #pragma once
 
+#include "color.hpp"
 #include <string>
 
 namespace Pelican {
@@ -10,7 +11,8 @@ class PelicanCore {
   public:
     PelicanCore();
     PelicanCore(std::string settings);
-    void run();
+    PelicanCore(std::string settings, bool reserve_stdout_for_protocol);
+    bool run();
 };
 
 } // namespace Pelican

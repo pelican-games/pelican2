@@ -1,7 +1,18 @@
 target_sources(pelican_core PRIVATE
+    atlasassetresource.cpp
+    spritescene.cpp
+    spriterenderer.cpp
+    debugdraw.cpp
+    debugtext.cpp
     polygoninstancecontainer.cpp
+    projectionjitter.cpp
     materialrender.cpp
+    uicontainer.cpp
     uirenderer.cpp
     fullscreenpassrenderer.cpp
+    frameresources.cpp
+    shadowdepthpasscontainer.cpp
     camera.cpp
+    temporal.cpp
+    velocitypasscontainer.cpp
 )

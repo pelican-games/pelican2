@@ -3,6 +3,7 @@
 #include "../container.hpp"
 
 #include "componentinfo.hpp"
+#include "archetypemigration.hpp"
 #include <details/ecs/coretemplate.hpp>
 
 namespace Pelican {
@@ -15,12 +16,25 @@ DECLARE_MODULE(ECSCore) {
   public:
     ECSCoreTemplatePublic &getTemplatePublicModule() { return sub; }
 
-    EntityId allocateEntity(std::span<const ComponentId> component_ids, std::span<void *> component_ptrs,
-                            size_t count) {
-        return sub.allocateEntity(component_ids, component_ptrs, count);
+    std::vector<EntityId> createEntities(std::span<const ComponentId> component_ids, size_t count,
+                                         const ECSCoreTemplatePublic::PopulateBatch &populate = {}) {
+        return sub.createEntities(component_ids, count, populate);
     }
-    void remove(EntityId id) { sub.remove(id); }
-    void compaction() { sub.compaction(); }
+    EntityId createEntity(std::span<const ComponentId> component_ids,
+                          const std::function<void(std::span<void *>)> &populate = {}) {
+        return sub.createEntity(component_ids, populate);
+    }
+    [[nodiscard]] bool remove(EntityId id) { return sub.remove(id); }
+    void addComponent(EntityId entity, ComponentId component,
+                      const ECSArchetypeMigration::Populate &populate = {},
+                      ECSArchetypeMigration::Adapters adapters = {}) {
+        ECSArchetypeMigration::add(sub, entity, component, populate, adapters);
+    }
+    void removeComponent(EntityId entity, ComponentId component,
+                         ECSArchetypeMigration::Adapters adapters = {}) {
+        ECSArchetypeMigration::remove(sub, entity, component, adapters);
+    }
+    void clearEntities() { sub.clearEntities(); }
 
     template <class TSystem, class... TComponents>
     SystemId registerSystem(TSystem & system, std::vector<SystemId> && depends_list, bool force_update = false) {

@@ -1,0 +1,22 @@
+{
+  "schema": "pelican.input_actions",
+  "version": 1,
+  "action_sets": [
+    {
+      "name": "gameplay",
+      "actions": [
+        {"name": "move", "type": "axis2"},
+        {"name": "jump", "type": "button"},
+        {"name": "look_x", "type": "axis1"},
+        {"name": "fire", "type": "button"}
+      ]
+    },
+    {
+      "name": "menu",
+      "actions": [
+        {"name": "confirm", "type": "button"},
+        {"name": "navigate", "type": "axis2"}
+      ]
+    }
+  ]
+}

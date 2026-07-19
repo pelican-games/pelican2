@@ -1,0 +1,367 @@
+#include "../src/core/shader/surfacecompiler.hpp"
+#include "../src/core/shader/shaderlibrary.hpp"
+#include "../src/core/loader/engineresources.hpp"
+#include "../src/project/materialformat.hpp"
+#include "../src/project/materiallowering.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+
+#ifndef PELICAN_TEST_SOURCE_DIR
+#define PELICAN_TEST_SOURCE_DIR "."
+#endif
+
+namespace Pelican {
+namespace {
+
+std::filesystem::path fixtureRoot() {
+    return std::filesystem::path{PELICAN_TEST_SOURCE_DIR} / "test" / "fixtures" /
+           "surface_format";
+}
+
+std::string readText(const std::filesystem::path &path) {
+    std::ifstream file{path, std::ios::binary};
+    if (!file.is_open()) throw std::runtime_error("failed to open " + path.string());
+    return {std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+}
+
+SurfaceFormatDocument engineLightingSurface(std::string_view resource_name) {
+    const auto source = std::string{"//! pelican.surface v1\n//! language: glsl\n\n"} +
+                        engineResourceOrThrow(resource_name);
+    return parseSurfaceFormat(source, std::string{"engine://"} + std::string{resource_name});
+}
+
+struct ScopedSpvLinkEnvironment {
+    std::optional<std::string> previous;
+    explicit ScopedSpvLinkEnvironment(const char *value) {
+        if (const auto *current = std::getenv("PELICAN_SPV_LINK")) previous = current;
+#ifdef _WIN32
+        _putenv_s("PELICAN_SPV_LINK", value == nullptr ? "" : value);
+#else
+        if (value == nullptr) unsetenv("PELICAN_SPV_LINK");
+        else setenv("PELICAN_SPV_LINK", value, 1);
+#endif
+    }
+    ~ScopedSpvLinkEnvironment() {
+#ifdef _WIN32
+        _putenv_s("PELICAN_SPV_LINK", previous ? previous->c_str() : "");
+#else
+        if (previous) setenv("PELICAN_SPV_LINK", previous->c_str(), 1);
+        else unsetenv("PELICAN_SPV_LINK");
+#endif
+    }
+};
+
+void requireCompiled(const SurfaceCompileResult &result) {
+    INFO("vertex log: " << result.vertex.log);
+    INFO("fragment log: " << result.fragment.log);
+    REQUIRE(result.vertex.ok);
+    REQUIRE(result.fragment.ok);
+    REQUIRE_FALSE(result.vertex.spirv.empty());
+    REQUIRE_FALSE(result.fragment.spirv.empty());
+}
+
+} // namespace
+
+TEST_CASE("SPV link backend is opt-in and keeps source composition as the default",
+          "[surface-compiler][spv-link]") {
+#if PELICAN_RUNTIME_SHADER_COMPILER
+    ScopedSpvLinkEnvironment environment{nullptr};
+    REQUIRE_FALSE(surfaceSpvLinkExperimentalEnabled());
+    const auto surface = parseSurfaceFormat(readText(fixtureRoot() / "valid" / "wp78.surface"),
+                                            "wp78.surface");
+    ShaderCompiler compiler;
+    const auto result = compileSurfaceShaders(compiler, surface, "wp78.surface");
+    requireCompiled(result);
+    REQUIRE_FALSE(result.experimental_spv_link);
+    REQUIRE(result.vertex_cache_key.empty());
+    REQUIRE(result.fragment_cache_key.empty());
+#endif
+}
+
+TEST_CASE("experimental SPV link compiles B hooks with split descriptor types and stable keys",
+          "[surface-compiler][spv-link]") {
+#if PELICAN_RUNTIME_SHADER_COMPILER
+    ScopedSpvLinkEnvironment environment{"experimental"};
+    REQUIRE(surfaceSpvLinkExperimentalEnabled());
+    const auto surface = parseSurfaceFormat(readText(fixtureRoot() / "valid" / "wp78.surface"),
+                                            "wp78.surface");
+    ShaderCompiler compiler;
+    const auto first = compileSurfaceShaders(compiler, surface, "wp78.surface");
+    const auto second = compileSurfaceShaders(compiler, surface, "wp78.surface");
+    requireCompiled(first);
+    requireCompiled(second);
+    REQUIRE(first.experimental_spv_link);
+    REQUIRE(first.vertex_cache_key == second.vertex_cache_key);
+    REQUIRE(first.fragment_cache_key == second.fragment_cache_key);
+    REQUIRE(first.fragment_cache_key.find("spirv-headers=09913f") != std::string::npos);
+    REQUIRE(first.fragment_cache_key.find("spirv-tools=f289d0") != std::string::npos);
+    REQUIRE(first.fragment_cache_key.find("spirv-reflect=c63785") != std::string::npos);
+    REQUIRE(first.fragment_cache_key.find("template-sha256=") != std::string::npos);
+    REQUIRE(first.fragment_cache_key.find("user-sha256=") != std::string::npos);
+
+    const auto has_binding = [&](std::uint32_t binding, std::string_view type) {
+        return std::any_of(first.fragment_bindings.begin(), first.fragment_bindings.end(),
+                           [&](const auto &item) {
+                               return item.set == 2 && item.binding == binding &&
+                                      item.descriptor_type == type;
+                           });
+    };
+    REQUIRE(has_binding(7, "sampled_image"));
+    REQUIRE(has_binding(8, "sampler"));
+
+    const auto variant = compileSurfaceShaders(compiler, surface, "wp78.surface",
+                                               SurfacePass::main, {"PELICAN_VARIANT_WARM"});
+    requireCompiled(variant);
+    REQUIRE(variant.fragment_cache_key != first.fragment_cache_key);
+
+    ShaderLibrary library{ShaderLibraryModuleMode::reflection_only};
+    const auto bundles = library.loadFromSurface(surface, "wp78.surface");
+    REQUIRE_FALSE(library.get(bundles.fragment).binding_table.empty());
+    REQUIRE(library.get(bundles.fragment).cache_key == first.fragment_cache_key);
+#endif
+}
+
+TEST_CASE("surface source composition compiles main depth and velocity variants",
+          "[surface-compiler]") {
+#if PELICAN_RUNTIME_SHADER_COMPILER
+    const auto source = readText(fixtureRoot() / "valid" / "wp78.surface");
+    const auto surface = parseSurfaceFormat(source, "wp78.surface");
+    ShaderCompiler compiler;
+    requireCompiled(compileSurfaceShaders(compiler, surface, "wp78.surface", SurfacePass::main));
+    requireCompiled(compileSurfaceShaders(compiler, surface, "wp78.surface", SurfacePass::depth));
+    requireCompiled(compileSurfaceShaders(compiler, surface, "wp78.surface", SurfacePass::velocity));
+    requireCompiled(compileSurfaceShaders(compiler, surface, "wp78.surface", SurfacePass::depth,
+                                          {"PELICAN_FEATURE_SHADOW"}));
+
+    const auto depth = composeSurfaceShaders(surface, "wp78.surface", SurfacePass::depth);
+    REQUIRE(std::find(depth.defines.begin(), depth.defines.end(), "PELICAN_PASS_DEPTH") !=
+            depth.defines.end());
+    REQUIRE(std::find(depth.defines.begin(), depth.defines.end(),
+                      "PELICAN_HAS_VERTEX_DISPLACE_V1") != depth.defines.end());
+    const auto shadow_depth = composeSurfaceShaders(surface, "wp78.surface", SurfacePass::depth,
+                                                    {"PELICAN_FEATURE_SHADOW"});
+    REQUIRE(std::find(shadow_depth.defines.begin(), shadow_depth.defines.end(),
+                      "PELICAN_FEATURE_SHADOW") != shadow_depth.defines.end());
+#endif
+}
+
+TEST_CASE("standard and toon lighting dogfood only the public surface library",
+          "[surface-compiler][dogfood]") {
+#if PELICAN_RUNTIME_SHADER_COMPILER
+    ShaderCompiler compiler;
+    for (const auto resource : {"shaders/material/standard_lighting.glsl",
+                                "shaders/material/toon_lighting.glsl"}) {
+        const auto surface = engineLightingSurface(resource);
+        REQUIRE(surface.hooks.lighting_v1);
+        requireCompiled(compileSurfaceShaders(compiler, surface,
+                                              std::string{"engine://"} + resource));
+    }
+#endif
+}
+
+TEST_CASE("OpenPBR registers and compiles all six forward cache variants",
+          "[surface-compiler][openpbr][variants]") {
+    const auto manifest = nlohmann::json::parse(
+        engineResourceOrThrow("surfaces/openpbr/manifest.json"));
+    REQUIRE(manifest.at("openpbr").at("version") == "1.1.1");
+    REQUIRE(manifest.at("openpbr").at("commit") ==
+            "f8d6d947dfae4c9b599965a86c22826ea7a8dbfb");
+    REQUIRE(manifest.at("lighting") ==
+            "engine://shaders/material/openpbr_lighting.glsl");
+    REQUIRE(manifest.at("variants").size() == 6);
+
+    const auto lighting = engineResourceOrThrow("shaders/material/openpbr_lighting.glsl");
+    REQUIRE(lighting.find("weighted_base_color = surface.base_color.rgb") !=
+            std::string_view::npos);
+    const auto surface_template =
+        engineResourceOrThrow("shaders/material/surface_v1.frag");
+    REQUIRE(surface_template.find("pelican_material_instance_uv") !=
+            std::string_view::npos);
+    REQUIRE(surface_template.find("pelican_material_instance_apply_base_color") !=
+            std::string_view::npos);
+    for (const auto public_call : {"pelican_light_count()", "pelican_light(",
+                                   "pelican_shadow(", "pelican_env_ambient("}) {
+        REQUIRE(lighting.find(public_call) != std::string_view::npos);
+    }
+    for (const auto private_symbol : {"pelicanLights", "pelicanFrame", "PELICAN_SET_",
+                                      "layout(set", "pelican_sets.glsl",
+                                      "pelican_frame.glsl"}) {
+        REQUIRE(lighting.find(private_symbol) == std::string_view::npos);
+    }
+
+    std::vector<std::string> names;
+    std::vector<std::string> resources;
+#if PELICAN_RUNTIME_SHADER_COMPILER
+    ShaderCompiler compiler;
+#endif
+    for (const auto &entry : manifest.at("variants")) {
+        const auto name = entry.at("name").get<std::string>();
+        const auto reference = entry.at("surface").get<std::string>();
+        const auto resource = reference.substr(std::string{"engine://"}.size());
+        names.push_back(name);
+        resources.push_back(reference);
+        const auto surface = parseSurfaceFormat(engineResourceOrThrow(resource), reference);
+        REQUIRE(surface.hooks.surface_v1);
+        REQUIRE(surface.hooks.lighting_v1);
+        MaterialDefinition material;
+        material.name = name;
+        material.surface = reference;
+        material.routing = MaterialVariantRouting{
+            entry.at("alpha_mode") == "opaque" ? MaterialAlphaMode::opaque
+                : entry.at("alpha_mode") == "mask" ? MaterialAlphaMode::mask
+                                                    : MaterialAlphaMode::blend,
+            entry.at("double_sided").get<bool>(),
+        };
+        const auto lowered = lowerMaterial(material, surface);
+        REQUIRE(lowered.target_pass ==
+                (material.routing->alpha_mode == MaterialAlphaMode::blend
+                     ? "forward_transparent"
+                     : "forward_opaque"));
+#if PELICAN_RUNTIME_SHADER_COMPILER
+        requireCompiled(compileSurfaceShaders(compiler, surface, reference));
+#endif
+    }
+    REQUIRE(names == std::vector<std::string>{
+                         "opaque_single_sided", "opaque_double_sided",
+                         "mask_single_sided", "mask_double_sided",
+                         "blend_single_sided", "blend_double_sided"});
+    REQUIRE(std::set<std::string>{resources.begin(), resources.end()}.size() == 6);
+
+    const auto example_root = std::filesystem::path{PELICAN_TEST_SOURCE_DIR} /
+                              "projects" / "example";
+    const auto example_reference =
+        std::string{"engine://surfaces/openpbr/opaque_double.surface"};
+    const auto example_surface = parseSurfaceFormat(
+        engineResourceOrThrow("surfaces/openpbr/opaque_double.surface"), example_reference);
+    MaterialSurfaceCatalog catalog;
+    catalog.emplace(example_reference, example_surface);
+    const auto material_document = parseMaterialFormatJson(
+        nlohmann::json::parse(readText(example_root / "materials" /
+                                      "openpbr_coat.material.json")),
+        catalog);
+    REQUIRE(material_document.warnings.empty());
+    REQUIRE(material_document.materials.size() == 1);
+    const auto example_lowered = lowerMaterial(material_document.materials.front(),
+                                               example_surface);
+    REQUIRE(example_lowered.routing->alpha_mode == MaterialAlphaMode::opaque);
+    REQUIRE(example_lowered.routing->double_sided);
+    REQUIRE(example_lowered.target_pass == "forward_opaque");
+    REQUIRE(example_lowered.defines == std::vector<std::string>{
+                                           "OPENPBR_PIN_V1_1_1",
+                                           "OPENPBR_PIN_F8D6D947DFAE4C9B599965A86C22826EA7A8DBFB"});
+}
+
+TEST_CASE("surface compile diagnostics report the authored snippet line",
+          "[surface-compiler][diagnostics]") {
+#if PELICAN_RUNTIME_SHADER_COMPILER
+    const auto path = fixtureRoot() / "invalid" / "compile_line.surface";
+    const auto surface = parseSurfaceFormat(readText(path), "compile_line.surface");
+    ShaderCompiler compiler;
+    const auto result = compileSurfaceShaders(compiler, surface, "compile_line.surface");
+    REQUIRE_FALSE(result.fragment.ok);
+    REQUIRE_THAT(result.fragment.log,
+                 Catch::Matchers::ContainsSubstring("compile_line.surface:6"));
+    REQUIRE_THAT(result.fragment.log,
+                 Catch::Matchers::ContainsSubstring("not_a_declared_symbol"));
+#endif
+}
+
+TEST_CASE("M3a source composition rejects non-GLSL surfaces by name", "[surface-compiler]") {
+    const auto source = readText(fixtureRoot() / "valid" / "minimal_hlsl.surface");
+    const auto surface = parseSurfaceFormat(source, "minimal_hlsl.surface");
+    REQUIRE_THROWS_WITH(composeSurfaceShaders(surface, "minimal_hlsl.surface"),
+                        Catch::Matchers::ContainsSubstring("minimal_hlsl.surface") &&
+                            Catch::Matchers::ContainsSubstring("GLSL only"));
+}
+
+TEST_CASE("example material is a one-line B surface reference that lowers and compiles",
+          "[surface-compiler][example]") {
+    const auto root = std::filesystem::path{PELICAN_TEST_SOURCE_DIR} / "projects" / "example";
+    const auto surface_source = readText(root / "shaders" / "toon.surface");
+    const auto surface = parseSurfaceFormat(surface_source,
+                                            "project://shaders/toon.surface");
+    MaterialSurfaceCatalog catalog;
+    catalog.emplace("project://shaders/toon.surface", surface);
+    const auto material_json = nlohmann::json::parse(
+        readText(root / "materials" / "toon.material.json"));
+    const auto document = parseMaterialFormatJson(material_json, catalog);
+    REQUIRE(document.materials.size() == 1);
+    REQUIRE(document.materials.front().surface == "project://shaders/toon.surface");
+    const auto lowered = lowerMaterial(document.materials.front(), surface);
+    REQUIRE(lowered.hooks.surface_v1);
+    REQUIRE(lowered.hooks.lighting_v1);
+#if PELICAN_RUNTIME_SHADER_COMPILER
+    ShaderCompiler compiler;
+    requireCompiled(compileSurfaceShaders(compiler, surface,
+                                          "project://shaders/toon.surface"));
+    ShaderLibrary library{ShaderLibraryModuleMode::reflection_only};
+    const auto bundles = library.loadFromSurface(surface, "project://shaders/toon.surface");
+    REQUIRE_FALSE(library.get(bundles.vertex).reflection.vertex_inputs.empty());
+    REQUIRE_FALSE(library.get(bundles.fragment).reflection.bindings.empty());
+    REQUIRE(std::find(library.get(bundles.fragment).defines.begin(),
+                      library.get(bundles.fragment).defines.end(),
+                      "PELICAN_HAS_LIGHTING_V1") !=
+            library.get(bundles.fragment).defines.end());
+#endif
+}
+
+TEST_CASE("example refraction surface exposes its named screen snapshot accessor",
+          "[surface-compiler][snapshot][example]") {
+    const auto path = std::filesystem::path{PELICAN_TEST_SOURCE_DIR} / "projects" / "example" /
+                      "shaders" / "refract.surface";
+    const auto surface = parseSurfaceFormat(readText(path), "project://shaders/refract.surface");
+    REQUIRE(surface.screen_inputs == std::vector<std::string>{"opaque_color"});
+    const auto composition = composeSurfaceShaders(surface, "project://shaders/refract.surface");
+    const auto params = std::find_if(composition.virtual_includes.begin(),
+                                     composition.virtual_includes.end(), [](const auto &include) {
+        return include.first == "__pelican_surface_params.glsl";
+    });
+    REQUIRE(params != composition.virtual_includes.end());
+    REQUIRE(params->second.find("layout(set = PELICAN_SET_PASS_INPUT, binding = 0)") !=
+            std::string::npos);
+    REQUIRE(params->second.find("pelican_screen_opaque_color") != std::string::npos);
+#if PELICAN_RUNTIME_SHADER_COMPILER
+    ShaderCompiler compiler;
+    requireCompiled(compileSurfaceShaders(compiler, surface,
+                                          "project://shaders/refract.surface"));
+    ShaderLibrary library{ShaderLibraryModuleMode::reflection_only};
+    const auto bundles = library.loadFromSurface(surface, "project://shaders/refract.surface");
+    const auto &bindings = library.get(bundles.fragment).reflection.bindings;
+    REQUIRE(std::any_of(bindings.begin(), bindings.end(), [](const auto &binding) {
+        return binding.set == 1 && binding.binding == 0 &&
+               binding.type == vk::DescriptorType::eCombinedImageSampler;
+    }));
+#endif
+}
+
+TEST_CASE("unchanged example toon surface compiles all skinned template variants",
+          "[surface-compiler][skeletal]") {
+#if PELICAN_RUNTIME_SHADER_COMPILER
+    const auto path = std::filesystem::path{PELICAN_TEST_SOURCE_DIR} / "projects" / "example" /
+                      "shaders" / "toon.surface";
+    const auto authored = readText(path);
+    const auto surface = parseSurfaceFormat(authored, "project://shaders/toon.surface");
+    REQUIRE(authored.substr(surface.code_offset) == surface.code);
+    ShaderCompiler compiler;
+    for (const auto pass : {SurfacePass::main, SurfacePass::depth, SurfacePass::velocity}) {
+        const auto composition = composeSurfaceShaders(surface, "project://shaders/toon.surface", pass,
+                                                       {"PELICAN_SKINNED"});
+        REQUIRE(std::find(composition.defines.begin(), composition.defines.end(), "PELICAN_SKINNED") !=
+                composition.defines.end());
+        requireCompiled(compileSurfaceShaders(compiler, surface, "project://shaders/toon.surface", pass,
+                                              {"PELICAN_SKINNED"}));
+    }
+#endif
+}
+
+} // namespace Pelican

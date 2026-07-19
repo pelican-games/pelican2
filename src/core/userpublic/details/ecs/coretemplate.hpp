@@ -7,18 +7,65 @@
 #include <set>
 #include <vector>
 #include <functional>
+#include <optional>
+#include <string>
 #include <tuple>
+#include <typeinfo>
+#include <type_traits>
 
 #include <details/ecs/componentdeclare.hpp>
 #include <details/ecs/chunk.hpp>
 
 namespace Pelican {
 
+using SystemId = uint64_t;
+
+class ECSArchetypeMigration;
+
 namespace internal {
     size_t getIndexFromComponentId_Ref(ComponentId id);
-}
+    void registerECSSystemComponentDependencies(
+        const void *core, SystemId system_id, std::string name,
+        std::vector<size_t> component_indices);
+    void unregisterECSSystemComponentDependencies(const void *core,
+                                                  SystemId system_id) noexcept;
+    void unregisterECSCoreComponentDependencies(const void *core) noexcept;
+    std::vector<std::string> ecsComponentDependentNames(size_t component_index);
 
-using SystemId = uint64_t;
+    enum class ECSHazardPolicy {
+        automatic_serialization,
+        strict,
+    };
+
+    struct ECSSystemComponentAccess {
+        size_t component_index;
+        std::string component_name;
+        bool writes;
+    };
+
+    struct ECSSystemGraphNode {
+        SystemId id;
+        std::string name;
+        std::vector<SystemId> dependencies;
+        std::vector<ECSSystemComponentAccess> component_accesses;
+    };
+
+    struct ECSAutomaticSerialization {
+        SystemId before;
+        SystemId after;
+        std::string before_name;
+        std::string after_name;
+        std::vector<std::string> component_names;
+    };
+
+    struct ECSExecutionPlan {
+        std::vector<std::vector<SystemId>> levels;
+        std::vector<ECSAutomaticSerialization> automatic_serializations;
+    };
+
+    ECSExecutionPlan buildECSExecutionPlan(std::span<const ECSSystemGraphNode> nodes,
+                                           ECSHazardPolicy hazard_policy);
+}
 
 template <class... TComponents>
 struct ChunkView {
@@ -26,19 +73,53 @@ struct ChunkView {
     size_t count;
 };
 
+template <class TSystem, class... TComponents>
+concept HasBatchProcess = requires(TSystem &system, std::span<ChunkView<TComponents...>> views) {
+    system.process(views);
+};
+
+template <class TSystem, class... TComponents>
+concept HasPerChunkProcess = requires(TSystem &system, std::tuple<TComponents *...> components, size_t count) {
+    system.process(components, count);
+};
+
+template <class TSystem>
+concept HasEcsWorkerDependencyPrepare = requires(TSystem &system, bool has_matching_chunks) {
+    system.prepareEcsWorkerDependencies(has_matching_chunks);
+};
+
+template <class TSystem, class... TComponents>
+concept HasEcsWorkerQueryDependencyPrepare =
+    requires(TSystem &system, std::span<ChunkView<TComponents...>> views) {
+        system.prepareEcsWorkerDependencies(views);
+    };
+
 class ECSCoreTemplatePublic {
+    friend class ECSArchetypeMigration;
+    friend class ECSArchetypeMigrationToken;
+    friend class ECSEntityMutationToken;
+    friend class ECSEntityMutation;
+
     // Component Management
   private:
     using ChunkIndex = size_t;
     using WithinChunkIndex = size_t;
 
-    std::vector<ECSComponentChunk> chunks_storage;
-
     struct EntityRef {
         ChunkIndex chunk_index;
         WithinChunkIndex array_index;
     };
-    std::vector<EntityRef> id_to_ref;
+
+    struct IdEntry {
+        std::optional<EntityRef> ref;
+        std::uint32_t generation = 0;
+        bool live = false;
+    };
+
+    std::vector<ECSComponentChunk> chunks_storage;
+    std::vector<IdEntry> id_table;
+    std::vector<std::uint32_t> free_indices;
+    bool mutation_active = false;
 
     struct VectorHash {
         size_t operator()(const std::vector<ComponentId> &v) const {
@@ -53,10 +134,230 @@ class ECSCoreTemplatePublic {
     // Map from sorted component IDs (Archetype) to list of chunk indices
     std::unordered_map<std::vector<ComponentId>, std::vector<ChunkIndex>, VectorHash> archetype_to_chunks;
 
+    struct MutationScope {
+        ECSCoreTemplatePublic &owner;
+        explicit MutationScope(ECSCoreTemplatePublic &value);
+        ~MutationScope();
+    };
+
+    std::optional<EntityRef> resolve(EntityId id) const noexcept;
+    void rebuildChunkCaches();
+    void releaseId(EntityId id) noexcept;
+
   public:
-    EntityId allocateEntity(std::span<const ComponentId> component_ids, std::span<void *> component_ptrs, size_t count);
-    void remove(EntityId id);
-    void compaction();
+    struct IsolationEntitySlot {
+        bool live = false;
+        std::uint32_t generation = 0;
+        std::optional<std::size_t> chunk_index;
+        std::optional<std::size_t> array_index;
+    };
+
+    struct IsolationChunk {
+        std::size_t count = 0;
+        std::uint64_t mask = 0;
+        std::vector<std::size_t> component_indices;
+        std::vector<std::uint64_t> component_versions;
+    };
+
+    struct IsolationSnapshot {
+        std::uint64_t global_tick = 0;
+        std::vector<std::uint32_t> free_indices;
+        std::vector<IsolationEntitySlot> entity_slots;
+        std::vector<IsolationChunk> chunks;
+    };
+
+    ~ECSCoreTemplatePublic();
+
+    using PopulateBatch =
+        std::function<void(std::span<const EntityId>, std::span<void *>, size_t)>;
+
+    std::vector<EntityId> createEntities(std::span<const ComponentId> component_ids, size_t count,
+                                         const PopulateBatch &populate = {});
+    EntityId createEntity(std::span<const ComponentId> component_ids,
+                          const std::function<void(std::span<void *>)> &populate = {});
+    [[nodiscard]] bool remove(EntityId id);
+    void removeOrThrow(EntityId id);
+    void clearEntities();
+    bool isAlive(EntityId id) const noexcept { return resolve(id).has_value(); }
+    size_t liveCount() const noexcept;
+    IsolationSnapshot isolationSnapshot() const {
+        IsolationSnapshot result;
+        result.global_tick = global_tick;
+        result.free_indices = free_indices;
+        result.entity_slots.reserve(id_table.size());
+        for (const auto &entry : id_table) {
+            result.entity_slots.push_back(IsolationEntitySlot{
+                .live = entry.live,
+                .generation = entry.generation,
+                .chunk_index = entry.ref
+                                   ? std::optional<std::size_t>{entry.ref->chunk_index}
+                                   : std::nullopt,
+                .array_index = entry.ref
+                                   ? std::optional<std::size_t>{entry.ref->array_index}
+                                   : std::nullopt,
+            });
+        }
+        result.chunks.reserve(chunks_storage.size());
+        for (const auto &chunk : chunks_storage) {
+            result.chunks.push_back(IsolationChunk{
+                .count = chunk.count,
+                .mask = chunk.mask,
+                .component_indices = chunk.indices,
+                .component_versions = chunk.component_versions,
+            });
+        }
+        return result;
+    }
+    EntityId forceGenerationForTesting(EntityId id, std::uint32_t generation);
+    static void validateFreshIndexCapacityForTesting(size_t id_table_size);
+    void *tryComponentRaw(EntityId id, ComponentId component_id);
+    void *componentRaw(EntityId id, ComponentId component_id);
+    [[nodiscard]] bool markComponentChanged(EntityId id, ComponentId component_id);
+
+    template <class TComponent> struct PreparedComponentValue {
+        TComponent *target = nullptr;
+        TComponent old_value;
+        TComponent next_value;
+        ECSComponentChunk *chunk = nullptr;
+        size_t component_index = 0;
+        uint64_t old_version = 0;
+        uint64_t publish_version = 0;
+        bool published = false;
+    };
+
+    template <class TComponent> struct PreparedComponentSwap {
+        ECSCoreTemplatePublic *core = nullptr;
+        ChunkIndex chunk_index = 0;
+        WithinChunkIndex row = 0;
+        std::size_t component_index = 0;
+        TComponent staged;
+        std::uint64_t old_version = 0;
+        std::uint64_t publish_version = 0;
+        bool published = false;
+
+        void publish() noexcept {
+            auto &chunk = core->chunks_storage[chunk_index];
+            auto *target = static_cast<TComponent *>(
+                chunk.at(component_index, row));
+            using std::swap;
+            swap(*target, staged);
+            chunk.component_versions[component_index] = publish_version;
+            published = true;
+        }
+
+        void rollback() noexcept {
+            if (!published) return;
+            auto &chunk = core->chunks_storage[chunk_index];
+            auto *target = static_cast<TComponent *>(
+                chunk.at(component_index, row));
+            using std::swap;
+            swap(*target, staged);
+            chunk.component_versions[component_index] = old_version;
+            published = false;
+        }
+
+        void finish() noexcept { published = false; }
+    };
+
+    // Existing-value projection counterpart to archetype migration. Every
+    // potentially throwing copy is completed before publication; publish and
+    // rollback only perform no-throw assignment plus exact version exchange.
+    template <class TComponent>
+        requires std::is_copy_constructible_v<TComponent> &&
+                 std::is_nothrow_copy_assignable_v<TComponent>
+    PreparedComponentValue<TComponent>
+    prepareComponentValue(EntityId id, const TComponent &next_value) {
+        const auto ref = resolve(id);
+        if (!ref.has_value()) {
+            throw std::runtime_error("ECS entity is not live: " + toString(id));
+        }
+        const auto component_index =
+            internal::getIndexFromComponentId_Ref(
+                ComponentIdByType<TComponent>::value);
+        auto &chunk = chunks_storage[ref->chunk_index];
+        if (!chunk.has(component_index)) {
+            throw std::runtime_error("ECS component is absent on entity " +
+                                     toString(id));
+        }
+        auto *target = static_cast<TComponent *>(
+            chunk.at(component_index, ref->array_index));
+        return PreparedComponentValue<TComponent>{
+            .target = target,
+            .old_value = *target,
+            .next_value = next_value,
+            .chunk = &chunk,
+            .component_index = component_index,
+            .old_version = chunk.getVersion(component_index),
+            .publish_version = global_tick,
+        };
+    }
+
+    template <class TComponent>
+        requires std::is_copy_constructible_v<TComponent> &&
+                 std::is_nothrow_swappable_v<TComponent>
+    PreparedComponentSwap<TComponent>
+    prepareComponentSwap(EntityId id, const TComponent &next_value) {
+        const auto ref = resolve(id);
+        if (!ref.has_value()) {
+            throw std::runtime_error("ECS entity is not live: " + toString(id));
+        }
+        const auto component_index = internal::getIndexFromComponentId_Ref(
+            ComponentIdByType<TComponent>::value);
+        auto &chunk = chunks_storage[ref->chunk_index];
+        if (!chunk.has(component_index)) {
+            throw std::runtime_error("ECS component is absent on entity " +
+                                     toString(id));
+        }
+        return PreparedComponentSwap<TComponent>{
+            .core = this,
+            .chunk_index = ref->chunk_index,
+            .row = ref->array_index,
+            .component_index = component_index,
+            .staged = next_value,
+            .old_version = chunk.getVersion(component_index),
+            .publish_version = global_tick,
+        };
+    }
+
+    template <class TComponent>
+        requires std::is_nothrow_copy_assignable_v<TComponent>
+    static void publishComponentValue(
+        PreparedComponentValue<TComponent> &prepared) noexcept {
+        *prepared.target = prepared.next_value;
+        prepared.chunk->updateVersion(prepared.component_index,
+                                      prepared.publish_version);
+        prepared.published = true;
+    }
+
+    template <class TComponent>
+        requires std::is_nothrow_copy_assignable_v<TComponent>
+    static void rollbackComponentValue(
+        PreparedComponentValue<TComponent> &prepared) noexcept {
+        if (!prepared.published) return;
+        *prepared.target = prepared.old_value;
+        prepared.chunk->updateVersion(prepared.component_index,
+                                      prepared.old_version);
+        prepared.published = false;
+    }
+
+    template <class TComponent> TComponent *tryComponent(EntityId id) {
+        return static_cast<TComponent *>(tryComponentRaw(id, ComponentIdByType<TComponent>::value));
+    }
+
+    template <class TComponent> TComponent &component(EntityId id) {
+        return *static_cast<TComponent *>(componentRaw(id, ComponentIdByType<TComponent>::value));
+    }
+
+    template <class TComponent>
+        requires std::is_copy_assignable_v<TComponent>
+    [[nodiscard]] bool setComponent(EntityId id, const TComponent &component_value) {
+        auto *target = tryComponent<TComponent>(id);
+        if (target == nullptr) {
+            return false;
+        }
+        *target = component_value;
+        return markComponentChanged(id, ComponentIdByType<TComponent>::value);
+    }
 
     // System Management
   private:
@@ -64,9 +365,15 @@ class ECSCoreTemplatePublic {
 
     struct InternalSystemWrapper {
         SystemId id;
+        std::string name;
         ComponentMask matching_mask = 0;
         // p_func receives dense indices
         std::function<void(ECSCoreTemplatePublic &, void*, const std::vector<ChunkIndex> &, const std::vector<size_t>&)> p_func;
+        // Runs on the ECS owner thread before this system is scheduled. It is
+        // the boundary for resolving services that worker code may only read.
+        std::function<void(ECSCoreTemplatePublic &, void *, const std::vector<ChunkIndex> &,
+                           const std::vector<size_t> &)>
+            prepare_func;
         
         void *system_ref; // Pointer to actual system instance
         std::vector<SystemId> depends_list;
@@ -82,10 +389,16 @@ class ECSCoreTemplatePublic {
     std::unordered_map<SystemId, InternalSystemWrapper> systems;
     uint64_t system_id_counter = 0;
     uint64_t global_tick = 1; // Starts at 1
+    bool execution_plan_dirty = true;
+    std::optional<internal::ECSHazardPolicy> cached_hazard_policy;
+    std::vector<std::vector<SystemId>> execution_levels;
 
   public:
     template <class TSystem, class... TComponents>
     SystemId registerSystem(TSystem &system, std::vector<SystemId> &&depends_list, bool force_update = false) {
+        static_assert(HasBatchProcess<TSystem, TComponents...> || HasPerChunkProcess<TSystem, TComponents...>,
+                      "Registered ECS system must provide a supported process function");
+
         SystemId id =  ++system_id_counter;
         
 
@@ -113,6 +426,7 @@ class ECSCoreTemplatePublic {
         
         InternalSystemWrapper wrapper;
         wrapper.id = id;
+        wrapper.name = typeid(TSystem).name();
         wrapper.system_ref = &system;
         wrapper.depends_list = std::move(depends_list);
         wrapper.component_indices = comp_indices;
@@ -120,6 +434,32 @@ class ECSCoreTemplatePublic {
         wrapper.write_indices = write_indices;
         wrapper.matching_mask = matching_mask;
         wrapper.force_update = force_update;
+        if constexpr (HasEcsWorkerQueryDependencyPrepare<TSystem, TComponents...>) {
+            wrapper.prepare_func = [](ECSCoreTemplatePublic &core, void *sys_ptr,
+                                      const std::vector<ChunkIndex> &chunks,
+                                      const std::vector<size_t> &indices) {
+                std::vector<ChunkView<TComponents...>> views;
+                views.reserve(chunks.size());
+                for (const auto chunk_idx : chunks) {
+                    auto &chunk = core.chunks_storage[chunk_idx];
+                    auto tuple = [&]<size_t... Is>(std::index_sequence<Is...>)
+                        -> std::tuple<TComponents *...> {
+                        using ComponentTypes = std::tuple<TComponents...>;
+                        return {static_cast<std::tuple_element_t<Is, ComponentTypes> *>(
+                            chunk.getRef(indices[Is]).ptr)...};
+                    }(std::index_sequence_for<TComponents...>{});
+                    views.push_back({tuple, chunk.size()});
+                }
+                static_cast<TSystem *>(sys_ptr)->prepareEcsWorkerDependencies(
+                    std::span<ChunkView<TComponents...>>{views});
+            };
+        } else if constexpr (HasEcsWorkerDependencyPrepare<TSystem>) {
+            wrapper.prepare_func = [](ECSCoreTemplatePublic &, void *sys_ptr,
+                                      const std::vector<ChunkIndex> &chunks,
+                                      const std::vector<size_t> &) {
+                static_cast<TSystem *>(sys_ptr)->prepareEcsWorkerDependencies(!chunks.empty());
+            };
+        }
         
         // Setup dependency graph
         for (auto dep : wrapper.depends_list) {
@@ -134,7 +474,7 @@ class ECSCoreTemplatePublic {
             bool executed_any = false;
 
             // 1. Process All (Batch)
-            if constexpr (requires { sys.process(std::span<ChunkView<TComponents...>>{}); }) {
+            if constexpr (HasBatchProcess<TSystem, TComponents...>) {
                 std::vector<ChunkView<TComponents...>> views;
                 views.reserve(chunks.size());
                 
@@ -153,11 +493,11 @@ class ECSCoreTemplatePublic {
                          if (max_version >= start_last_run_tick) any_change = true;
                      }
 
-                    auto tuple = [&]<size_t... Is>(std::index_sequence<Is...>) {
-                        return std::make_tuple(
-                            static_cast<TComponents *>(chunk.getRef(indices[Is]).ptr)...
-                        );
-                    }(std::make_index_sequence<sizeof...(TComponents)>{});
+                    auto tuple = [&]<size_t... Is>(std::index_sequence<Is...>) -> std::tuple<TComponents *...> {
+                        using ComponentTypes = std::tuple<TComponents...>;
+                        return {static_cast<std::tuple_element_t<Is, ComponentTypes> *>(
+                            chunk.getRef(indices[Is]).ptr)...};
+                    }(std::index_sequence_for<TComponents...>{});
                     
                     views.push_back({tuple, chunk.size()});
                 }
@@ -176,7 +516,7 @@ class ECSCoreTemplatePublic {
             }
             
             // 2. Process (Per Chunk)
-            if constexpr (requires { sys.process(std::tuple<TComponents*...>{}, size_t{}); }) {
+            if constexpr (HasPerChunkProcess<TSystem, TComponents...>) {
                 for (auto chunk_idx : chunks) {
                     auto &chunk = core.chunks_storage[chunk_idx];
                     
@@ -192,11 +532,11 @@ class ECSCoreTemplatePublic {
                          continue; 
                     }
 
-                    auto tuple = [&]<size_t... Is>(std::index_sequence<Is...>) {
-                        return std::make_tuple(
-                            static_cast<TComponents *>(chunk.getRef(indices[Is]).ptr)...
-                        );
-                    }(std::make_index_sequence<sizeof...(TComponents)>{});
+                    auto tuple = [&]<size_t... Is>(std::index_sequence<Is...>) -> std::tuple<TComponents *...> {
+                        using ComponentTypes = std::tuple<TComponents...>;
+                        return {static_cast<std::tuple_element_t<Is, ComponentTypes> *>(
+                            chunk.getRef(indices[Is]).ptr)...};
+                    }(std::index_sequence_for<TComponents...>{});
                     
                     sys.process(tuple, chunk.size());
                     executed_any = true;
@@ -213,6 +553,7 @@ class ECSCoreTemplatePublic {
         };
 
         systems.emplace(id, std::move(wrapper));
+        execution_plan_dirty = true;
         
         // Check existing chunks
         for (size_t i = 0; i < chunks_storage.size(); ++i) {
@@ -220,6 +561,9 @@ class ECSCoreTemplatePublic {
                 systems.at(id).matching_chunk_indices.push_back(i);
             }
         }
+
+        internal::registerECSSystemComponentDependencies(
+            this, id, systems.at(id).name, comp_indices);
 
         return id;
     }

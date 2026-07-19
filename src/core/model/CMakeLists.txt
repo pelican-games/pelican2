@@ -1,7 +1,17 @@
 target_sources(pelican_core PRIVATE
     vertbufcontainer.cpp
     gltf.cpp
+    modeltemplate.cpp
+    skeletalanimation.cpp
+    vrmaanimation.hpp
+    vrmfirstperson.cpp
+    vrmsemantic.cpp
 )
+if(PELICAN_WITH_VAT)
+target_sources(pelican_core PRIVATE
+    vatformat.cpp
+)
+endif()
 
 FetchContent_Declare(
   tinygltf

@@ -1,3 +1,29 @@
 target_sources(pelican_core PRIVATE
+    computetask.cpp
+    debugdrawpassinfojsonparser.cpp
+    debugtextpassinfojsonparser.cpp
+    frameplanner.cpp
+    framegraphruntime.cpp
+    fullscreenpassinfojsonparser.cpp
+    materialpassinfojsonparser.cpp
+    passattachmentoptionsjsonparser.cpp
+    passdefinitionjsonparser.cpp
+    passinfojsonparser.cpp
+    passsequencejsonparser.cpp
+    previewgraph.cpp
     renderingpasscontainer.cpp
+    renderingpassconfigloader.cpp
+    renderingpassconfigjsonparser.cpp
+    renderingpassdefinitionjsonparser.cpp
+    renderingpassjsonhelpers.cpp
+    renderingpassconfigregistration.cpp
+    renderingpassruntimecompiler.cpp
+    renderingpasstargetjsonparser.cpp
+    renderingpassvalidation.cpp
+    rendertargetconfigregistration.cpp
+    rendertargetimageviewresolver.cpp
+    rendertargetjsonparser.cpp
+    rendertargetmetadataresolver.cpp
+    rendertargetnameresolver.cpp
+    rendertargetcontainer.cpp
 )

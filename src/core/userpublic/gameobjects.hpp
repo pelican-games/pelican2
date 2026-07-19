@@ -1,20 +1,23 @@
 #pragma once
 
 #include <details/ecs/componentdeclare.hpp>
+#include <components/localtransform.hpp>
+#include "export.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <span>
 #include <tuple>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace Pelican {
 
-// TODO
-using GameObjectId = uint64_t;
 using ComponentId = uint64_t;
 
-class GameObjects {
+class PELICAN_API GameObjects {
   private:
     template <ComponentId... id> struct ComponentIdHolder {
         template <class T> using Append = ComponentIdHolder<id..., ComponentIdByType<T>::value>;
@@ -45,8 +48,8 @@ class GameObjects {
         static constexpr size_t value = Indices::first;
     };
 
-    static GameObjectId alloc(const ComponentId *ids, void **ptrs, uint32_t components_count);
-    static void commit(const ComponentId *ids, void *const *ptrs, uint32_t components_count);
+    static GameObjectId create(std::span<const ComponentId> ids,
+                               const std::function<void(std::span<void *>)> &populate);
 
     template <class Indices, class Tuple, size_t... Seq>
     static void copy(void **ptrs, Tuple t, Indices indices, std::index_sequence<Seq...>) {
@@ -65,19 +68,20 @@ class GameObjects {
             using NewComponentIds = typename ComponentIds::template Append<T>;
             return AddGameObjectContext<NewComponentIds, DataComponentIndices, ComponentDataTuple>{data};
         }
-        template <class T> auto addComponent(const T &component) {
+        template <class T>
+            requires std::is_copy_assignable_v<T>
+        auto addComponent(const T &component) {
             using NewComponentIds = typename ComponentIds::template Append<T>;
             using NewComponentIndices = typename DataComponentIndices::template Append<ComponentIds::len>;
             auto data2 = std::tuple_cat(data, std::tuple<const T &>(component));
             return AddGameObjectContext<NewComponentIds, NewComponentIndices, decltype(data2)>{data2};
         }
-        void finish() {
+        GameObjectId finish() {
             auto ids = ComponentIds::ids();
-            void *ptrs[ComponentIds::len];
-            GameObjects::alloc(ids.data(), ptrs, std::size(ptrs));
-            GameObjects::copy(ptrs, data, DataComponentIndices{},
-                              std::make_index_sequence<std::tuple_size<ComponentDataTuple>::value>());
-            GameObjects::commit(ids.data(), ptrs, std::size(ptrs));
+            return GameObjects::create(ids, [&](std::span<void *> ptrs) {
+                GameObjects::copy(ptrs.data(), data, DataComponentIndices{},
+                                  std::make_index_sequence<std::tuple_size<ComponentDataTuple>::value>());
+            });
         };
     };
 
@@ -86,16 +90,16 @@ class GameObjects {
             using NewComponentIds = ComponentIds::template Append<T>;
             return AddGameObjectContextWithoutData<NewComponentIds>{};
         }
-        template <class T> auto addComponent(const T &component) {
+        template <class T>
+            requires std::is_copy_assignable_v<T>
+        auto addComponent(const T &component) {
             using NewComponentIds = ComponentIds::template Append<T>;
             auto data = std::tuple<const T &>(component);
             return AddGameObjectContext<NewComponentIds, IndexHolder<ComponentIds::len>, decltype(data)>{data};
         }
-        void finish() {
+        GameObjectId finish() {
             auto ids = ComponentIds::ids();
-            void *ptrs[ComponentIds::len];
-            GameObjects::alloc(ids.data(), ptrs, std::size(ptrs));
-            GameObjects::commit(ids.data(), ptrs, std::size(ptrs));
+            return GameObjects::create(ids, {});
         };
     };
 
@@ -103,7 +107,9 @@ class GameObjects {
         template <class T> auto addComponent() {
             return AddGameObjectContextWithoutData<ComponentIdHolder<ComponentIdByType<T>::value>>{};
         }
-        template <class T> auto addComponent(const T &component) {
+        template <class T>
+            requires std::is_copy_assignable_v<T>
+        auto addComponent(const T &component) {
             auto data = std::tuple<const T &>(component);
             return AddGameObjectContext<ComponentIdHolder<ComponentIdByType<T>::value>, IndexHolder<0>, decltype(data)>{
                 data};
@@ -111,7 +117,13 @@ class GameObjects {
     };
 
     static auto add() { return AddGameObjectContextEmpty{}; }
-    static void remove(GameObjectId id);
+    static GameObjectId createWithComponents(std::span<const ComponentId> ids,
+                                             const std::function<void(std::span<void *>)> &populate);
+    [[nodiscard]] static bool remove(GameObjectId id);
+    static void removeAll();
+    static size_t liveCountForTesting();
+    static LocalTransformComponent localTransform(GameObjectId id);
+    [[nodiscard]] static bool setLocalTransform(GameObjectId id, const LocalTransformComponent &transform);
 };
 
 } // namespace Pelican
