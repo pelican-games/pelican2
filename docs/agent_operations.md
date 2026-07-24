@@ -36,7 +36,7 @@
 - 交差が避けられないファイル(gamecontext・rpcserver・test/CMakeLists)は
   「末尾追記」等の作法を指示し、**統合時にシニアが競合を解決**
 - golden テストを複数 WP が追加する場合、各 WP で
-  `python test/golden_inventory.py --repo-root . --update` を実行し、**case/file/hash/trace
+  `python -B test/golden_inventory.py --repo-root . --update` を実行し、**case/file/hash/trace
   membership の inventory diff を明示**する。統合時は再生成して交差差分を確認する
 
 ## 3. codex の起動標準
@@ -91,7 +91,7 @@ Claude が設計ドラフト(vN)
 1. diff の専有領域チェック(規約違反がないか)
 2. マージ(競合はシニアが解決)→ フルビルド → **ctest 全件**
 3. **golden inventory を GPU なしで照合**
-   (`python test/golden_inventory.py --repo-root .`)してから、golden は verbose で
+   (`python -B test/golden_inventory.py --repo-root .`)してから、golden は verbose で
    SKIP 検査(`ctest -R golden -V` で SKIP/例外の握りを確認 — 「全部 passed」だけを
    信じない。過去に本物のプランナエラーが SKIP に化けて素通りした)
 4. player の起動スモーク(8 秒)
